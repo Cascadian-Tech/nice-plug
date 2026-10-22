@@ -5,7 +5,7 @@ use clap_sys::id::{CLAP_INVALID_ID, clap_id};
 use clap_sys::string_sizes::CLAP_NAME_SIZE;
 use nice_plug_core::context::PluginApi;
 use nice_plug_core::context::activate::ActivateContext;
-use nice_plug_core::context::process::{ProcessContext, SendEventError, Transport};
+use nice_plug_core::context::process::{HostCall, ProcessContext, SendEventError, Transport};
 use nice_plug_core::context::remote_controls::{
     RemoteControlsContext, RemoteControlsPage, RemoteControlsSection,
 };
@@ -50,6 +50,7 @@ pub(crate) struct WrapperProcessContext<'a, P: ClapPlugin> {
     pub(super) input_events_guard: AtomicRefMut<'a, VecDeque<PluginNoteEvent<P>>>,
     //pub(super) output_events_guard: AtomicRefMut<'a, VecDeque<PluginNoteEvent<P>>>,
     pub(super) transport: Transport,
+    pub(super) host_call: HostCall,
     // used to clamp out of bounds events to the buffer's length.
     pub(super) total_buffer_len: u32,
     pub(super) current_sample_idx: u32,
@@ -122,6 +123,11 @@ impl<P: ClapPlugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
     #[inline]
     fn transport(&self) -> &Transport {
         &self.transport
+    }
+
+    #[inline]
+    fn host_call(&self) -> &HostCall {
+        &self.host_call
     }
 
     fn next_event(&mut self) -> Option<PluginNoteEvent<P>> {
@@ -639,10 +645,23 @@ impl<P: ClapPlugin> nice_plug_core::context::gui::GuiContextInner for WrapperGui
     }
 
     fn set_state(&self, state: nice_plug_core::plugin::PluginState) {
+        if let Err(refusal) = self.try_set_state(state) {
+            crate::nice_error!(
+                "Refused to restore state: {} (detail {})",
+                refusal.reason,
+                refusal.detail
+            );
+        }
+    }
+
+    fn try_set_state(
+        &self,
+        state: nice_plug_core::plugin::PluginState,
+    ) -> Result<(), nice_plug_core::plugin::StateRefusal> {
         self.wrapper
             .upgrade()
             .unwrap()
-            .set_state_object_from_gui(state)
+            .try_set_state_object_from_gui(state)
     }
 
     fn request_restart(&self) {

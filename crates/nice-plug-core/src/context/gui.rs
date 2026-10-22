@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::{
     params::{Param, internals::ParamPtr},
-    plugin::{Plugin, PluginState},
+    plugin::{Plugin, PluginState, StateRefusal},
 };
 
 use super::PluginApi;
@@ -88,6 +88,14 @@ impl GuiContext {
         self.inner.set_state(state);
     }
 
+    /// Like [`set_state()`][Self::set_state()], returning the plugin's refusal if it would not
+    /// accept the state (see
+    /// [`Plugin::ATOMIC_STATE_RESTORE`][crate::plugin::Plugin::ATOMIC_STATE_RESTORE]); nothing
+    /// is written then.
+    pub fn try_set_state(&self, state: PluginState) -> Result<(), StateRefusal> {
+        self.inner.try_set_state(state)
+    }
+
     /// Request the plugin to be restarted.
     pub fn request_restart(&self) {
         self.inner.request_restart();
@@ -144,6 +152,15 @@ pub trait GuiContextInner: Send + Sync + 'static {
     /// host. If the plugin is currently processing audio, then the parameter values will be
     /// restored at the end of the current processing cycle.
     fn set_state(&self, state: PluginState);
+
+    /// Like [`set_state()`][Self::set_state()], returning the plugin's refusal if it would not
+    /// accept the state (see
+    /// [`Plugin::ATOMIC_STATE_RESTORE`][crate::plugin::Plugin::ATOMIC_STATE_RESTORE]); nothing
+    /// is written then. Wrappers override this; the default cannot report a refusal.
+    fn try_set_state(&self, state: PluginState) -> Result<(), StateRefusal> {
+        self.set_state(state);
+        Ok(())
+    }
 
     /// Request the plugin to be restarted.
     fn request_restart(&self);

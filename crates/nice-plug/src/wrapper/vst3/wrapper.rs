@@ -1,11 +1,15 @@
 use atomic_refcell::AtomicRefMut;
 use nice_plug_core::audio_setup::{AuxiliaryBuffers, BufferConfig, ProcessMode};
-use nice_plug_core::context::process::Transport;
+use nice_plug_core::context::process::{
+    HostCall, HostSegment, HostSegmentRaw, HostSegmentValidity, Transport,
+};
 #[cfg(feature = "editor")]
 use nice_plug_core::editor::Editor;
 use nice_plug_core::midi::{Channel, Key, MidiConfig, NoteEvent, VoiceID};
 use nice_plug_core::params::ParamFlags;
-use nice_plug_core::plugin::ProcessStatus;
+use nice_plug_core::plugin::{
+    PluginState, ProcessStatus, RestoreContext, RestoreOrigin, RestoreThread, StateRefusal,
+};
 use std::ffi::c_void;
 use std::mem::{self, MaybeUninit};
 use std::num::NonZeroU32;
@@ -87,6 +91,20 @@ impl<P: Vst3Plugin> Wrapper<P> {
         Self {
             inner: WrapperInner::new(),
         }
+    }
+
+    /// The pristine signature (T1 maintainer fix): a caller that never heard of
+    /// [`StateRefusal`] still compiles against this fork unchanged.
+    pub fn set_state_object_from_gui(&self, state: PluginState) {
+        self.inner.set_state_object_from_gui(state)
+    }
+
+    /// Restore a state object from the plugin's own GUI or preset management, as the GUI context
+    /// does. Returns the plugin's refusal, if any (see
+    /// [`Plugin::ATOMIC_STATE_RESTORE`][nice_plug_core::plugin::Plugin::ATOMIC_STATE_RESTORE]);
+    /// nothing is written then.
+    pub fn try_set_state_object_from_gui(&self, state: PluginState) -> Result<(), StateRefusal> {
+        self.inner.try_set_state_object_from_gui(state)
     }
 }
 
@@ -545,14 +563,20 @@ impl<P: Vst3Plugin> IComponentTrait for Wrapper<P> {
         }
 
         match unsafe { state::deserialize_json(&read_buffer) } {
-            Some(mut state) => {
-                if self.inner.set_state_inner(&mut state) {
+            Some(state) => match self.inner.restore_state_object(state, RestoreOrigin::Host) {
+                Ok(()) => {
                     crate::nice_trace!("Loaded state ({} bytes)", read_buffer.len());
                     kResultOk
-                } else {
+                }
+                Err(refusal) => {
+                    crate::nice_error!(
+                        "Refused to load state: {} (detail {})",
+                        refusal.reason,
+                        refusal.detail
+                    );
                     kResultFalse
                 }
-            }
+            },
             None => kResultFalse,
         }
     }
@@ -1076,6 +1100,13 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
             crate::nice_debug_assert!(data.numSamples >= 0);
 
             let total_buffer_len = data.numSamples as usize;
+            // One serial per host call, shared by every slice below. VST3 supplies one process
+            // context per call and no intra-call transport events, so the raw segment is the
+            // whole call's, anchored at its first frame.
+            let host_call_serial = self.inner.host_call_serial.fetch_add(1, Ordering::Relaxed) + 1;
+            // In flight until this closure returns, by any path (T1 round-4 fix)
+            let _in_call = state::CallInFlight::enter(&self.inner.in_call);
+            let host_segment = host_segment_from_vst3(data.processContext);
 
             let current_audio_io_layout = self.inner.current_audio_io_layout.load();
             let has_main_input = current_audio_io_layout.main_input_channels.is_some();
@@ -1592,8 +1623,15 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
 
                             let host_out_events = unsafe { ComRef::from_raw(data.outputEvents) };
 
+                            let host_call = HostCall {
+                                serial: host_call_serial,
+                                frames: total_buffer_len as u32,
+                                slice_offset: block_start as u32,
+                                segment: host_segment,
+                            };
                             let mut context = self.inner.make_process_context(
                                 transport,
+                                host_call,
                                 host_out_events,
                                 total_buffer_len,
                                 block_start,
@@ -1602,6 +1640,28 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                             let result =
                                 plugin.process(buffers.main_buffer, &mut aux, &mut context);
                             self.inner.last_process_status.store(result);
+
+                            // The call's last slice commits a restore handed over under the
+                            // atomic contract, under this slice's own plugin guard (T1 round-4
+                            // fix; pool round-4 terra): the audio thread takes no lock of its own
+                            // for it. After all of this call's automation, as before.
+                            if P::ATOMIC_STATE_RESTORE
+                                && block_end == total_buffer_len
+                                && !matches!(result, ProcessStatus::Error(_))
+                            {
+                                self.inner.restores.service(|pending| {
+                                    let restore = RestoreContext {
+                                        origin: pending.origin,
+                                        thread: RestoreThread::Audio,
+                                    };
+                                    pending.outcome = self.inner.commit_restore_holding(
+                                        &mut plugin,
+                                        &mut pending.state,
+                                        &*pending.prepared,
+                                        restore,
+                                    );
+                                });
+                            }
                             result
                         } else {
                             ProcessStatus::Error("Failed to acquire plugin lock")
@@ -1630,24 +1690,28 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                 }
             };
 
-            // After processing audio, we'll check if the editor has sent us updated plugin state.
-            // We'll restore that here on the audio thread to prevent changing the values during the
-            // process call and also to prevent inconsistent state when the host also wants to load
-            // plugin state.
-            // FIXME: Zero capacity channels allocate on receiving, find a better alternative that
-            //        doesn't do that
-            let updated_state = permit_alloc(|| self.inner.updated_state_receiver.try_recv());
-            if let Ok(mut state) = updated_state {
-                self.inner.set_state_inner(&mut state);
-
-                // We'll pass the state object back to the GUI thread so deallocation can happen
-                // there without potentially blocking the audio thread
-                if let Err(err) = self.inner.updated_state_sender.send(state) {
-                    crate::nice_debug_assert_failure!(
-                        "Failed to send state object back to GUI thread: {}",
-                        err
-                    );
-                };
+            // After processing audio, we'll check if the editor or the host has handed us a state
+            // to restore. We'll restore that here on the audio thread to prevent changing the
+            // values during the process call and also to prevent inconsistent state when the host
+            // also wants to load plugin state. One atomic load when nothing is pending; the state
+            // is committed in place and freed by the thread that handed it over (T1 round-3 fix:
+            // this used to be a zero-capacity channel's `try_recv()`, which locks a mutex on every
+            // call, under a `permit_alloc`).
+            // A plugin without the atomic contract commits here, as pinned (its commit takes no
+            // plugin lock). Under the contract a call whose last slice held no plugin guard -- a
+            // parameter flush, which never reaches the plugin -- commits nothing (T1 round-5 fix;
+            // round 4 took a `try_lock()` here): the restore waits for a call with audio, or for
+            // the restoring thread's own one-second fallback.
+            if !P::ATOMIC_STATE_RESTORE {
+                self.inner.restores.service(|pending| {
+                    let restore = RestoreContext {
+                        origin: pending.origin,
+                        thread: RestoreThread::Audio,
+                    };
+                    pending.outcome =
+                        self.inner
+                            .commit_restore(&mut pending.state, &*pending.prepared, restore);
+                });
             }
 
             result
@@ -1764,6 +1828,66 @@ impl<P: Vst3Plugin> INoteExpressionControllerTrait for Wrapper<P> {
         _value: *mut NoteExpressionValue,
     ) -> tresult {
         kResultFalse
+    }
+}
+
+/// The raw transport segment from a VST3 process context, anchored at the call's first frame.
+/// The gated fields the host did not flag as valid read as zero; `raw` keeps every value the
+/// context carried, flagged or not, with the context's own `state` word (T1 round-3).
+/// `projectTimeSamples` carries no flag.
+#[allow(clippy::unnecessary_cast)]
+fn host_segment_from_vst3(context: *const vst3::Steinberg::Vst::ProcessContext) -> HostSegment {
+    if context.is_null() {
+        return HostSegment::ABSENT;
+    }
+
+    // SAFETY: a non-null process context from the host's process data, valid for the call.
+    let context = unsafe { &*context };
+    let has = |flag: u32| context.state & flag != 0;
+    let raw = HostSegmentRaw {
+        flags: context.state,
+        tempo: context.tempo,
+        tempo_increment: 0.0,
+        beats: context.projectTimeMusic,
+        seconds: 0.0,
+        samples: context.projectTimeSamples,
+        bar_start: context.barPositionMusic,
+        time_sig_numerator: context.timeSigNumerator,
+        time_sig_denominator: context.timeSigDenominator,
+    };
+    let valid = HostSegmentValidity {
+        tempo: has(kTempoValid as u32),
+        tempo_increment: false,
+        beats: has(kProjectTimeMusicValid as u32),
+        seconds: false,
+        samples: true,
+        bar_start: has(kBarPositionValid as u32),
+        time_signature: has(kTimeSigValid as u32),
+    };
+
+    HostSegment {
+        start_frame: 0,
+        from_event: false,
+        playing: has(kPlaying as u32),
+        preroll: false,
+        valid,
+        tempo: if valid.tempo { raw.tempo } else { 0.0 },
+        tempo_increment: 0.0,
+        beats: if valid.beats { raw.beats } else { 0.0 },
+        seconds: 0.0,
+        samples: raw.samples,
+        bar_start: if valid.bar_start { raw.bar_start } else { 0.0 },
+        time_sig_numerator: if valid.time_signature {
+            raw.time_sig_numerator
+        } else {
+            0
+        },
+        time_sig_denominator: if valid.time_signature {
+            raw.time_sig_denominator
+        } else {
+            0
+        },
+        raw,
     }
 }
 

@@ -1,6 +1,7 @@
 //! Traits and structs describing plugins and editors. This includes extension structs for features
 //! that are specific to one or more plugin-APIs.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 mod state;
@@ -219,6 +220,64 @@ pub trait Plugin: Default + Send + 'static {
     ///
     /// This is an advanced feature that the vast majority of plugins won't need to implement.
     fn filter_state(state: &mut PluginState) {}
+
+    /// Whether state restores follow the all-or-nothing contract. When `true`:
+    ///
+    /// - [`preflight_state()`][Self::preflight_state()] sees the whole incoming state (after
+    ///   [`filter_state()`][Self::filter_state()]) before any parameter or persistent field is
+    ///   written and may refuse it; a refused restore writes nothing and the reason reaches the
+    ///   restore's origin (a host load fails, a GUI
+    ///   [`try_set_state()`][crate::context::gui::GuiContext::try_set_state()] returns it).
+    /// - An accepted restore writes every parameter and every persistent field, then
+    ///   [`state_restored()`][Self::state_restored()] runs, all on the committing thread.
+    /// - While the plugin is processing, a restore from the host or the GUI is committed on the
+    ///   audio thread at the end of the next process call, after that call's automation and
+    ///   before the next call's, so the preflight sees the live state and nothing changes
+    ///   between two slices of one call. The host's load call waits for that call; if none comes
+    ///   within a second (a host that keeps a bypassed plugin "processing" without calling it)
+    ///   the restore is committed on the calling thread instead. Nothing in that audio-thread
+    ///   path allocates, locks or waits: persistent fields are staged off the audio thread by
+    ///   [`prepare_fields()`][Self::prepare_fields()] before the restore crosses over, so the
+    ///   committing thread only calls the already-prepared
+    ///   [`PreparedFields::commit()`][PreparedFields::commit()] -- `Params::deserialize_fields()`
+    ///   is never reached under this contract (T1 maintainer fix, section 8, S-28).
+    ///
+    /// When `false` (the default) restores keep their previous behaviour and neither hook is
+    /// called.
+    const ATOMIC_STATE_RESTORE: bool = false;
+
+    /// Off-audio preparation for this restore's persisted fields, under
+    /// [`ATOMIC_STATE_RESTORE`][Self::ATOMIC_STATE_RESTORE]: parse and validate everything
+    /// [`Params::deserialize_fields()`][crate::params::Params::deserialize_fields()] would apply,
+    /// from the state [`filter_state()`][Self::filter_state()] already saw, returning a value
+    /// whose [`PreparedFields::commit()`][PreparedFields::commit()] is the only part that runs on
+    /// the committing thread. Called once per restore, on the thread that is restoring the state
+    /// -- never the audio thread -- before [`preflight_state()`][Self::preflight_state()] runs,
+    /// so parsing and any allocation it needs happen there. The default stages nothing: a plugin
+    /// with no persisted fields need not override this.
+    fn prepare_fields(fields: &BTreeMap<String, String>) -> Box<dyn PreparedFields<Self>>
+    where
+        Self: Sized,
+    {
+        Box::new(NoFields)
+    }
+
+    /// Examine a whole incoming state before anything is written, under
+    /// [`ATOMIC_STATE_RESTORE`][Self::ATOMIC_STATE_RESTORE]. Return `Err` to refuse it
+    /// atomically. This runs on the committing thread, which is the audio thread while
+    /// processing: it must not allocate, lock, wait or do I/O.
+    fn preflight_state(
+        &self,
+        state: &PluginState,
+        restore: RestoreContext,
+    ) -> Result<(), StateRefusal> {
+        Ok(())
+    }
+
+    /// Called after an accepted restore has written every parameter and persistent field, on
+    /// the committing thread and before any later process slice: baseline held controls here.
+    /// The same realtime rules as [`preflight_state()`][Self::preflight_state()] apply.
+    fn state_restored(&mut self, restore: RestoreContext) {}
 
     //
     // The following functions follow the lifetime of the plugin.

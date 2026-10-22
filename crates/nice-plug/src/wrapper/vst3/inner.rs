@@ -1,10 +1,9 @@
 use atomic_refcell::AtomicRefCell;
 use crossbeam::atomic::AtomicCell;
-use crossbeam::channel;
 use nice_plug_core::audio_setup::{AudioIOLayout, BufferConfig, ProcessMode};
 #[cfg(feature = "editor")]
 use nice_plug_core::context::gui::GuiContext;
-use nice_plug_core::context::process::Transport;
+use nice_plug_core::context::process::{HostCall, Transport};
 #[cfg(feature = "editor")]
 use nice_plug_core::editor::dpi::Size;
 #[cfg(feature = "editor")]
@@ -14,13 +13,16 @@ use nice_plug_core::params::internals::ParamPtr;
 use nice_plug_core::params::{ParamFlags, Params};
 #[cfg(feature = "editor")]
 use nice_plug_core::plugin::TrackInfo;
-use nice_plug_core::plugin::{Plugin, PluginState, ProcessStatus, TaskExecutor};
+use nice_plug_core::plugin::{
+    NoFields, Plugin, PluginState, PreparedFields, ProcessStatus, RestoreContext, RestoreOrigin,
+    RestoreThread, StateRefusal, TaskExecutor,
+};
 use parking_lot::Mutex;
 #[cfg(feature = "editor")]
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use try_lock::TryLock;
 #[cfg(feature = "editor")]
 use vst3::ComWrapper;
@@ -111,6 +113,14 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
 
     /// The last process status returned by the plugin. This is used for tail handling.
     pub last_process_status: AtomicCell<ProcessStatus>,
+    /// Serial of the host's process calls, rising by one per `IAudioProcessor::process()` call
+    /// for the lifetime of this instance. Reported to the plugin through
+    /// [`ProcessContext::host_call()`][nice_plug_core::context::process::ProcessContext::host_call()].
+    pub host_call_serial: AtomicU64,
+    /// Raised while a process call is in flight, between its slices included (T1 round-4 fix):
+    /// a calling-thread atomic commit hands its restore to the call's end instead of landing
+    /// between two slices. See [`state::CallInFlight`].
+    pub in_call: AtomicBool,
     /// The current latency in samples, as set by the plugin through the [`ActivateContext`] and the
     /// [`ProcessContext`].
     pub current_latency: AtomicU32,
@@ -140,17 +150,14 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
     /// then do the block splitting based on that. Note events need to have their timing adjusted to
     /// match the block start, since they're all read upfront.
     pub process_events: AtomicRefCell<Vec<ProcessEvent<P>>>,
-    /// The plugin is able to restore state through a method on the `GuiContext`. To avoid changing
-    /// parameters mid-processing and running into garbled data if the host also tries to load state
-    /// at the same time the restoring happens at the end of each processing call. If this zero
-    /// capacity channel contains state data at that point, then the audio thread will take the
-    /// state out of the channel, restore the state, and then send it back through the same channel.
-    /// In other words, the GUI thread acts as a sender and then as a receiver, while the audio
-    /// thread acts as a receiver and then as a sender. That way deallocation can happen on the GUI
-    /// thread. All of this happens without any blocking on the audio thread.
-    pub updated_state_sender: channel::Sender<PluginState>,
-    /// The receiver belonging to [`new_state_sender`][Self::new_state_sender].
-    pub updated_state_receiver: channel::Receiver<PluginState>,
+    /// The plugin is able to restore state through a method on the `GuiContext`, and the host loads
+    /// state. To avoid changing parameters mid-processing and running into garbled data, while
+    /// processing the restore happens at the end of a processing call: the restoring thread posts
+    /// it here, the audio thread commits it in place, and the restoring thread takes it back with
+    /// its outcome and frees it. The audio side is atomics only (T1 round-3 fix; the pinned
+    /// zero-capacity channel locked a mutex on every process call): see
+    /// [`state::RestoreMailbox`].
+    pub restores: state::RestoreMailbox<state::PendingRestore<P>>,
 
     /// The keys from `param_map` in a stable order.
     pub param_hashes: Vec<u32>,
@@ -238,10 +245,6 @@ impl<P: Vst3Plugin> WrapperInner<P> {
     pub fn new() -> Arc<Self> {
         let mut plugin = P::default();
         let task_executor = Mutex::new(plugin.task_executor());
-
-        // This is used to allow the plugin to restore preset data from its editor, see the comment
-        // on `Self::updated_state_sender`
-        let (updated_state_sender, updated_state_receiver) = channel::bounded(0);
 
         // This is a mapping from the parameter IDs specified by the plugin to pointers to those
         // parameters. These pointers are assumed to be safe to dereference as long as
@@ -361,6 +364,8 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             #[cfg(feature = "editor")]
             current_track_info: AtomicRefCell::new(TrackInfo::default()),
             last_process_status: AtomicCell::new(ProcessStatus::Normal),
+            host_call_serial: AtomicU64::new(0),
+            in_call: AtomicBool::new(false),
             current_latency: AtomicU32::new(0),
             // This is initialized just before calling `Plugin::activate()` so that during the
             // process call buffers can be initialized without any allocations
@@ -371,8 +376,7 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             input_note_events,
             note_expression_controller: AtomicRefCell::new(NoteExpressionController::default()),
             process_events: AtomicRefCell::new(Vec::with_capacity(P::INPUT_EVENT_CAPACITY)),
-            updated_state_sender,
-            updated_state_receiver,
+            restores: state::RestoreMailbox::new(),
 
             param_hashes,
             param_by_hash,
@@ -457,6 +461,7 @@ impl<P: Vst3Plugin> WrapperInner<P> {
     pub fn make_process_context<'a>(
         &'a self,
         transport: Transport,
+        host_call: HostCall,
         host_out_events: Option<ComRef<'a, IEventList>>,
         total_buffer_len: usize,
         current_sample_idx: usize,
@@ -465,6 +470,7 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             inner: self,
             input_events_guard: self.input_note_events.borrow_mut(),
             transport,
+            host_call,
             host_out_events,
             total_buffer_len: total_buffer_len as u32,
             current_sample_idx: current_sample_idx as u32,
@@ -585,58 +591,160 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         }
     }
 
+    /// The pristine signature (T1 maintainer fix): a caller that never heard of
+    /// [`StateRefusal`] still compiles against this fork unchanged. Discards the refusal after
+    /// logging it.
+    pub fn set_state_object_from_gui(&self, state: PluginState) {
+        if let Err(refusal) = self.try_set_state_object_from_gui(state) {
+            crate::nice_error!(
+                "Refused to restore state: {} (detail {})",
+                refusal.reason,
+                refusal.detail
+            );
+        }
+    }
+
     /// Update the plugin's internal state, called by the plugin itself from the GUI thread. To
     /// prevent corrupting data and changing parameters during processing the actual state is only
-    /// updated at the end of the audio processing cycle.
-    #[cfg(feature = "editor")]
-    pub fn set_state_object_from_gui(&self, mut state: PluginState) {
-        use crossbeam::channel::SendTimeoutError;
+    /// updated at the end of the audio processing cycle. Returns the plugin's refusal, if any
+    /// (see [`Plugin::ATOMIC_STATE_RESTORE`]); nothing is written then.
+    pub fn try_set_state_object_from_gui(&self, state: PluginState) -> Result<(), StateRefusal> {
+        self.restore_state_object(state, RestoreOrigin::Gui)
+    }
 
-        // Use a loop and timeouts to handle the super rare edge case when this function gets called
-        // between a process call and the host disabling the plugin
-        loop {
-            if self.is_processing.load(Ordering::SeqCst) {
-                // If the plugin is currently processing audio, then we'll perform the restore
-                // operation at the end of the audio call. This involves sending the state to the
-                // audio thread, having the audio thread handle the state restore at the very end of
-                // the process function, and then sending the state back to this thread so it can be
-                // deallocated without blocking the audio thread.
+    /// Restore a state object from the host or the GUI. While the plugin is processing, a GUI
+    /// restore (and, under [`Plugin::ATOMIC_STATE_RESTORE`], a host load as well) is handed to
+    /// the audio thread, which commits it at the end of its process call and hands the object
+    /// back with the outcome; otherwise the calling thread commits it right here.
+    ///
+    /// `Plugin::filter_state()` and, under the atomic contract, `Plugin::prepare_fields()` both
+    /// run right here, off the audio thread, before any threading decision (T1 maintainer fix):
+    /// whichever thread ends up committing only has to call `commit_restore()`.
+    ///
+    /// One restore at a time (T1 round-3 fix): a second restoring thread waits up to a second for
+    /// the first to finish and is refused with [`StateRefusal::BUSY`] otherwise, nothing written.
+    /// Everything the audio thread used to do besides the commit itself -- the hand-back, posting
+    /// `Task::StateChanged`, the unknown-parameter warning -- happens here, on this thread.
+    pub fn restore_state_object(
+        &self,
+        mut state: PluginState,
+        origin: RestoreOrigin,
+    ) -> Result<(), StateRefusal> {
+        let (outcome, committed_on_audio) = {
+            // Under the atomic contract one restore at a time (T1 round-3 fix): a second restoring
+            // thread waits up to a second for the first, then is refused with nothing written.
+            // A plugin without the contract keeps the pinned behaviour (T1 round-4 fix): its
+            // restorers only queue for the mailbox, below, and never get refused.
+            let _atomic_restorer = if P::ATOMIC_STATE_RESTORE {
                 match self
-                    .updated_state_sender
-                    .send_timeout(state, std::time::Duration::from_secs(1))
+                    .restores
+                    .restorer(Some(std::time::Duration::from_secs(1)))
                 {
-                    Ok(_) => {
-                        // As mentioned above, the state object will be passed back to this thread
-                        // so we can deallocate it without blocking.
-                        let state = self.updated_state_receiver.recv();
-                        drop(state);
-                        break;
-                    }
-                    Err(SendTimeoutError::Timeout(value)) => {
-                        state = value;
-                        continue;
-                    }
-                    Err(SendTimeoutError::Disconnected(_)) => {
-                        crate::nice_debug_assert_failure!("State update channel got disconnected");
-                        return;
-                    }
+                    Some(guard) => Some(guard),
+                    None => return Err(StateRefusal::BUSY),
                 }
             } else {
-                // Otherwise we'll set the state right here and now, since this function should be
-                // called from a GUI thread
-                self.set_state_inner(&mut state);
-                break;
+                None
+            };
+
+            let prepared: Box<dyn PreparedFields<P>> = if P::ATOMIC_STATE_RESTORE {
+                // Off the audio thread, before any threading decision (T1 maintainer fix)
+                P::filter_state(&mut state);
+                state::report_unknown_params(
+                    &state,
+                    state::make_params_getter(&self.param_by_hash, &self.param_id_to_hash),
+                );
+                P::prepare_fields(&state.fields)
+            } else {
+                // As pinned: `filter_state()` runs on the committing thread, in
+                // `state::deserialize_object()` (T1 round-4 fix)
+                Box::new(NoFields)
+            };
+            let mut pending = state::PendingRestore {
+                state,
+                origin,
+                outcome: Ok(()),
+                prepared,
+            };
+            let mut via_audio = origin == RestoreOrigin::Gui || P::ATOMIC_STATE_RESTORE;
+
+            // Use a loop and timeouts to handle the super rare edge case when this function gets
+            // called between a process call and the host disabling the plugin
+            loop {
+                if via_audio && self.is_processing.load(Ordering::SeqCst) {
+                    // If the plugin is currently processing audio, then we'll perform the restore
+                    // operation at the end of the audio call: the audio thread commits it in place
+                    // and this thread takes it back, with its outcome, and frees it. Without the
+                    // atomic contract a second restorer waits here for the mailbox for as long as
+                    // the first needs it, as the pinned shared channel made it wait.
+                    let _restorer = if P::ATOMIC_STATE_RESTORE {
+                        None
+                    } else {
+                        self.restores.restorer(None)
+                    };
+                    match self
+                        .restores
+                        .hand_to_audio(pending, Some(std::time::Duration::from_secs(1)))
+                    {
+                        Ok(returned) => break (returned.outcome, true),
+                        Err(untaken) => {
+                            pending = untaken;
+                            // A host load must not wait on a processing loop that is not running
+                            // (some hosts keep a bypassed plugin "processing" without calling it):
+                            // commit it on this thread after all. Under the atomic contract a GUI
+                            // restore too (T1 round-5 fix): only a call with audio commits on the
+                            // audio thread, so while only buffer-less calls run nothing else
+                            // would; and this thread's commit is safe while processing, since it
+                            // takes the plugin's lock and never lands inside a call.
+                            if origin == RestoreOrigin::Host || P::ATOMIC_STATE_RESTORE {
+                                via_audio = false;
+                            }
+                            continue;
+                        }
+                    }
+                } else {
+                    // Otherwise we'll set the state right here and now, on the calling thread --
+                    // unless a process call is between two of its slices (T1 round-4 fix): then
+                    // the call's own end commits it, through the mailbox, like any audio-thread
+                    // restore.
+                    let restore = RestoreContext {
+                        origin,
+                        thread: RestoreThread::Caller,
+                    };
+                    match self.commit_restore(&mut pending.state, &*pending.prepared, restore) {
+                        Err(refusal) if refusal == state::CALL_IN_FLIGHT => {
+                            via_audio = true;
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                            continue;
+                        }
+                        outcome => break (outcome, false),
+                    }
+                }
             }
+        };
+
+        // Under the atomic contract the audio thread posts nothing itself (T1 round-3 fix); without
+        // it the audio thread already posted this, as pinned
+        #[cfg(feature = "editor")]
+        if committed_on_audio && outcome.is_ok() && P::ATOMIC_STATE_RESTORE {
+            let task_posted = self.schedule_gui(Task::StateChanged);
+            crate::nice_debug_assert!(task_posted, "The task queue is full, dropping task...");
+        }
+        #[cfg(not(feature = "editor"))]
+        let _ = committed_on_audio;
+
+        if origin == RestoreOrigin::Gui && outcome.is_ok() {
+            // After the state has been updated, notify the host about the new parameter values
+            let task_posted = self
+                .event_loop
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .schedule_gui(Task::TriggerRestart(RestartFlags_::kParamValuesChanged));
+            crate::nice_debug_assert!(task_posted, "The task queue is full, dropping task...");
         }
 
-        // After the state has been updated, notify the host about the new parameter values
-        let task_posted = self
-            .event_loop
-            .borrow()
-            .as_ref()
-            .unwrap()
-            .schedule_gui(Task::TriggerRestart(RestartFlags_::kParamValuesChanged));
-        crate::nice_debug_assert!(task_posted, "The task queue is full, dropping task...");
+        outcome
     }
 
     pub fn set_latency_samples(&self, samples: u32) {
@@ -652,44 +760,120 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         crate::nice_debug_assert!(task_posted, "The task queue is full, dropping task...");
     }
 
-    /// Immediately set the plugin state. Returns `false` if the deserialization failed. The plugin
-    /// state is set from a couple places, so this function aims to deduplicate that. Includes
-    /// `permit_alloc()`s around the deserialization and initialization for the use case where
-    /// `set_state_object_from_gui()` was called while the plugin is process audio.
+    /// The pristine signature (T1 maintainer fix): a caller using only what the framework
+    /// exposed before this delta still compiles and still gets a correct restore. Stages fields
+    /// itself, on whichever thread calls this, so call it off the audio thread; the normal path
+    /// (`restore_state_object()`) stages them before any threading decision instead. Kept for
+    /// source compatibility; `WrapperInner` is `pub(crate)` (pristine too), so nothing outside
+    /// this crate can reach it, and nothing inside calls it either (same as pristine, where it
+    /// had no caller besides the drain loop, which now calls `commit_restore()` instead).
+    #[allow(dead_code)]
+    pub fn set_state_inner(&self, state: &mut PluginState) -> bool {
+        let prepared: Box<dyn PreparedFields<P>> = if P::ATOMIC_STATE_RESTORE {
+            P::filter_state(state);
+            P::prepare_fields(&state.fields)
+        } else {
+            // `filter_state()` runs in `state::deserialize_object()`, as pinned
+            Box::new(NoFields)
+        };
+        let restore = RestoreContext {
+            origin: RestoreOrigin::Gui,
+            thread: RestoreThread::Caller,
+        };
+        self.commit_restore(state, &*prepared, restore).is_ok()
+    }
+
+    /// The atomic commit with the plugin already held by the caller (T1 round-4 fix; pool
+    /// round-4 terra): a process call commits a restore handed to it inside its last slice, under
+    /// that slice's own plugin guard, so the audio thread takes no lock of its own for it. Posts
+    /// nothing; the restoring thread does (T1 round-3 fix).
+    pub fn commit_restore_holding(
+        &self,
+        plugin: &mut P,
+        state: &mut PluginState,
+        prepared: &dyn PreparedFields<P>,
+        restore: RestoreContext,
+    ) -> Result<(), StateRefusal> {
+        let params_getter = state::make_params_getter(&self.param_by_hash, &self.param_id_to_hash);
+        let buffer_config = self.current_buffer_config.load();
+        unsafe {
+            state::commit_atomic_restore::<P>(
+                state,
+                plugin,
+                params_getter,
+                buffer_config.as_ref(),
+                prepared,
+                restore,
+            )
+        }
+    }
+
+    /// Immediately set the plugin state. Returns the plugin's refusal if it would not accept the
+    /// state (see [`Plugin::ATOMIC_STATE_RESTORE`]), in which case nothing was written. The
+    /// plugin state is set from a couple places, so this function aims to deduplicate that.
+    /// Without the atomic contract this includes a `permit_alloc()` around the deserialization
+    /// for the use case where `set_state_object_from_gui()` was called while the plugin is
+    /// processing audio. `prepared` was already built off the audio thread by
+    /// `Plugin::prepare_fields()` (T1 maintainer fix, section 8, S-28); under the atomic contract
+    /// it is the only thing that writes persistent fields, so `Params::deserialize_fields()` is
+    /// never reached from here.
     ///
-    /// Implicitly emits `Task::ParameterValuesChanged`.
+    /// Implicitly emits `Task::StateChanged` when committed on the calling thread; after an
+    /// audio-thread commit the restoring thread posts it instead (T1 round-3 fix).
     ///
     /// # Notes
     ///
     /// `self.plugin` must _not_ be locked while calling this function or it will deadlock.
-    pub fn set_state_inner(&self, state: &mut PluginState) -> bool {
-        // FIXME: This is obviously not realtime-safe, but loading presets without doing this
-        //        could lead to inconsistencies. `state::deserialize_object()` normally never
-        //        allocates, but if the plugin has persistent non-parameter data then its
-        //        `deserialize_fields()` implementation may still allocate.
-        let success = permit_alloc(|| unsafe {
-            state::deserialize_object::<P>(
-                state,
-                self.params.clone(),
-                state::make_params_getter(&self.param_by_hash, &self.param_id_to_hash),
-                self.current_buffer_config.load().as_ref(),
-            )
-        });
-        if !success {
-            crate::nice_debug_assert_failure!(
-                "Deserializing plugin state from a state object failed"
-            );
-            return false;
+    pub fn commit_restore(
+        &self,
+        state: &mut PluginState,
+        prepared: &dyn PreparedFields<P>,
+        restore: RestoreContext,
+    ) -> Result<(), StateRefusal> {
+        let params_getter = state::make_params_getter(&self.param_by_hash, &self.param_id_to_hash);
+        let buffer_config = self.current_buffer_config.load();
+        if P::ATOMIC_STATE_RESTORE {
+            // The plugin's hooks see the live instance, so this needs the plugin lock: free
+            // between process calls and while not processing, taken only if the host activates
+            // or deactivates concurrently, in which case nothing is written. Never waited for.
+            let Some(mut plugin) = self.plugin.try_lock() else {
+                return Err(StateRefusal::BUSY);
+            };
+            // Read under the plugin's lock (T1 round-4 fix): a call that is between two slices
+            // raised the flag before its first slice took and released this lock.
+            if restore.thread == RestoreThread::Caller && self.in_call.load(Ordering::SeqCst) {
+                return Err(state::CALL_IN_FLIGHT);
+            }
+            self.commit_restore_holding(&mut plugin, state, prepared, restore)?;
+        } else {
+            // FIXME: This is obviously not realtime-safe, but loading presets without doing this
+            //        could lead to inconsistencies. `state::deserialize_object()` normally never
+            //        allocates, but if the plugin has persistent non-parameter data then its
+            //        `deserialize_fields()` implementation may still allocate.
+            permit_alloc(|| unsafe {
+                state::deserialize_object::<P>(
+                    state,
+                    None,
+                    self.params.clone(),
+                    params_getter,
+                    buffer_config.as_ref(),
+                    restore,
+                )
+            })?;
         }
 
+        // Reinitialize the plugin after loading state so it can respond to the new parameter
+        // values. Under the atomic contract from the calling thread only: after an audio-thread
+        // commit, `restore_state_object()` posts this on the restoring thread (T1 round-3 fix), so
+        // nothing here touches the event loop or the host's run loop from the audio thread.
+        // Without the contract wherever the commit runs, as pinned (T1 round-4 fix).
         #[cfg(feature = "editor")]
-        {
-            // Reinitialize the plugin after loading state so it can respond to the new parameter values
+        if restore.thread == RestoreThread::Caller || !P::ATOMIC_STATE_RESTORE {
             let task_posted = self.schedule_gui(Task::StateChanged);
             crate::nice_debug_assert!(task_posted, "The task queue is full, dropping task...");
         }
 
-        success
+        Ok(())
     }
 }
 

@@ -1,12 +1,14 @@
 use nice_plug_core::context::PluginApi;
 use nice_plug_core::context::activate::ActivateContext;
-use nice_plug_core::context::process::{ProcessContext, SendEventError, Transport};
+use nice_plug_core::context::process::{HostCall, ProcessContext, SendEventError, Transport};
 use nice_plug_core::midi::PluginNoteEvent;
 use nice_plug_core::plugin::Plugin;
 
 #[cfg(feature = "editor")]
 use nice_plug_core::{
-    context::gui::GuiContextInner, params::internals::ParamPtr, plugin::PluginState,
+    context::gui::GuiContextInner,
+    params::internals::ParamPtr,
+    plugin::{PluginState, StateRefusal},
 };
 
 use super::backend::Backend;
@@ -29,6 +31,7 @@ pub(crate) struct WrapperProcessContext<'a, P: Plugin, B: Backend<P>> {
     pub(super) input_events_idx: usize,
     pub(super) output_events: &'a mut Vec<PluginNoteEvent<P>>,
     pub(super) transport: Transport,
+    pub(super) host_call: HostCall,
 }
 
 impl<P: Plugin, B: Backend<P>> ActivateContext<P> for WrapperActivateContext<'_, P, B> {
@@ -67,6 +70,11 @@ impl<P: Plugin, B: Backend<P>> ProcessContext<P> for WrapperProcessContext<'_, P
     #[inline]
     fn transport(&self) -> &Transport {
         &self.transport
+    }
+
+    #[inline]
+    fn host_call(&self) -> &HostCall {
+        &self.host_call
     }
 
     fn next_event(&mut self) -> Option<PluginNoteEvent<P>> {
@@ -185,10 +193,20 @@ impl<P: Plugin, B: Backend<P>> GuiContextInner for WrapperGuiContext<P, B> {
     }
 
     fn set_state(&self, state: PluginState) {
+        if let Err(refusal) = self.try_set_state(state) {
+            crate::nice_error!(
+                "Refused to restore state: {} (detail {})",
+                refusal.reason,
+                refusal.detail
+            );
+        }
+    }
+
+    fn try_set_state(&self, state: PluginState) -> Result<(), StateRefusal> {
         self.wrapper
             .upgrade()
             .unwrap()
-            .set_state_object_from_gui(state)
+            .try_set_state_object_from_gui(state)
     }
 
     fn request_restart(&self) {

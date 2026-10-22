@@ -1,4 +1,5 @@
 [package]
+workspace = "../.."
 name = "nice-plug-derive"
 version = "0.1.2"
 edition.workspace = true

@@ -434,6 +434,15 @@ impl EnumParamInner {
         Some(ids[self.unmodulated_plain_value() as usize])
     }
 
+    /// The variant index a serialized stable string identifier names, without setting anything:
+    /// `None` if no variant has that id, or if this enum has no stable ids at all. What
+    /// [`set_from_id()`][Self::set_from_id()] would set, checked before any write (T1: the
+    /// all-or-nothing restore validates every value before it commits one).
+    pub fn index_of_id(&self, id: &str) -> Option<usize> {
+        self.ids
+            .and_then(|ids| ids.iter().position(|candidate| *candidate == id))
+    }
+
     /// Set the parameter based on a serialized stable string identifier. Return whether the ID was
     /// known and the parameter was set.
     pub fn set_from_id(&self, id: &str) -> bool {

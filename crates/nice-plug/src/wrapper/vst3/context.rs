@@ -3,7 +3,7 @@ use nice_plug_core::{
     context::{
         PluginApi,
         activate::ActivateContext,
-        process::{ProcessContext, SendEventError, Transport},
+        process::{HostCall, ProcessContext, SendEventError, Transport},
     },
     midi::{Channel, Key, MidiConfig, NoteEvent, PluginNoteEvent},
 };
@@ -25,7 +25,9 @@ use vst3::Steinberg::Vst::IComponentHandlerTrait;
 
 #[cfg(feature = "editor")]
 use nice_plug_core::{
-    context::gui::GuiContextInner, params::internals::ParamPtr, plugin::PluginState,
+    context::gui::GuiContextInner,
+    params::internals::ParamPtr,
+    plugin::{PluginState, StateRefusal},
 };
 
 use crate::wrapper::vst3::Vst3Plugin;
@@ -64,6 +66,7 @@ pub(crate) struct WrapperProcessContext<'a, P: Vst3Plugin> {
     pub(super) inner: &'a WrapperInner<P>,
     pub(super) input_events_guard: AtomicRefMut<'a, VecDeque<PluginNoteEvent<P>>>,
     pub(super) transport: Transport,
+    pub(super) host_call: HostCall,
     pub(super) host_out_events: Option<ComRef<'a, IEventList>>,
     // used to clamp out of bounds events to the buffer's length.
     pub(super) total_buffer_len: u32,
@@ -126,6 +129,11 @@ impl<P: Vst3Plugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
     #[inline]
     fn transport(&self) -> &Transport {
         &self.transport
+    }
+
+    #[inline]
+    fn host_call(&self) -> &HostCall {
+        &self.host_call
     }
 
     fn next_event(&mut self) -> Option<PluginNoteEvent<P>> {
@@ -487,10 +495,20 @@ impl<P: Vst3Plugin + Send> GuiContextInner for WrapperGuiContext<P> {
     }
 
     fn set_state(&self, state: PluginState) {
+        if let Err(refusal) = self.try_set_state(state) {
+            crate::nice_error!(
+                "Refused to restore state: {} (detail {})",
+                refusal.reason,
+                refusal.detail
+            );
+        }
+    }
+
+    fn try_set_state(&self, state: PluginState) -> Result<(), StateRefusal> {
         self.inner
             .upgrade()
             .unwrap()
-            .set_state_object_from_gui(state)
+            .try_set_state_object_from_gui(state)
     }
 
     fn request_restart(&self) {

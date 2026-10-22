@@ -64,18 +64,22 @@ use clap_sys::process::{
 };
 use clap_sys::stream::{clap_istream, clap_ostream};
 use crossbeam::atomic::AtomicCell;
-use crossbeam::channel::{self, SendTimeoutError};
 use crossbeam::queue::ArrayQueue;
 use nice_plug_core::audio_setup::{AudioIOLayout, AuxiliaryBuffers, BufferConfig, ProcessMode};
 #[cfg(feature = "editor")]
 use nice_plug_core::context::gui::GuiContext;
-use nice_plug_core::context::process::Transport;
+use nice_plug_core::context::process::{
+    HostCall, HostSegment, HostSegmentRaw, HostSegmentValidity, Transport,
+};
 #[cfg(feature = "editor")]
 use nice_plug_core::editor::{Editor, SpawnedEditor};
 use nice_plug_core::midi::{Channel, Key, MidiConfig, NoteEvent, PluginNoteEvent, VoiceID};
 use nice_plug_core::params::internals::ParamPtr;
 use nice_plug_core::params::{ParamFlags, Params};
-use nice_plug_core::plugin::{Plugin, PluginState, ProcessStatus, TaskExecutor};
+use nice_plug_core::plugin::{
+    NoFields, Plugin, PluginState, PreparedFields, ProcessStatus, RestoreContext, RestoreOrigin,
+    RestoreThread, StateRefusal, TaskExecutor,
+};
 #[cfg(feature = "editor")]
 use nice_plug_core::plugin::{TrackColor, TrackInfo};
 use parking_lot::Mutex;
@@ -87,7 +91,7 @@ use std::mem;
 use std::num::NonZeroU32;
 use std::os::raw::c_char;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
@@ -164,6 +168,14 @@ pub struct Wrapper<P: ClapPlugin> {
     input_events: AtomicRefCell<VecDeque<PluginNoteEvent<P>>>,
     /// The last process status returned by the plugin. This is used for tail handling.
     last_process_status: AtomicCell<ProcessStatus>,
+    /// Serial of the host's process calls, rising by one per `clap_plugin::process()` call for
+    /// the lifetime of this instance. Reported to the plugin through
+    /// [`ProcessContext::host_call()`][nice_plug_core::context::process::ProcessContext::host_call()].
+    host_call_serial: AtomicU64,
+    /// Raised while a process call is in flight, between its slices included (T1 round-4 fix):
+    /// a calling-thread atomic commit hands its restore to the call's end instead of landing
+    /// between two slices. See [`state::CallInFlight`].
+    in_call: AtomicBool,
     /// Whether the latency has changed since the last call to `activate`. When this is set,
     /// `latency_changed` needs to be called in `activate` in order to inform the host of the
     /// latency change.
@@ -175,17 +187,14 @@ pub struct Wrapper<P: ClapPlugin> {
     /// A data structure that helps manage and create buffers for all of the plugin's inputs and
     /// outputs based on channel pointers provided by the host.
     buffer_manager: AtomicRefCell<BufferManager>,
-    /// The plugin is able to restore state through a method on the `GuiContext`. To avoid changing
-    /// parameters mid-processing and running into garbled data if the host also tries to load state
-    /// at the same time the restoring happens at the end of each processing call. If this zero
-    /// capacity channel contains state data at that point, then the audio thread will take the
-    /// state out of the channel, restore the state, and then send it back through the same channel.
-    /// In other words, the GUI thread acts as a sender and then as a receiver, while the audio
-    /// thread acts as a receiver and then as a sender. That way deallocation can happen on the GUI
-    /// thread. All of this happens without any blocking on the audio thread.
-    updated_state_sender: channel::Sender<PluginState>,
-    /// The receiver belonging to [`new_state_sender`][Self::new_state_sender].
-    updated_state_receiver: channel::Receiver<PluginState>,
+    /// The plugin is able to restore state through a method on the `GuiContext`, and the host loads
+    /// state. To avoid changing parameters mid-processing and running into garbled data, while
+    /// processing the restore happens at the end of a processing call: the restoring thread posts
+    /// it here, the audio thread commits it in place, and the restoring thread takes it back with
+    /// its outcome and frees it. The audio side is atomics only (T1 round-3 fix; the pinned
+    /// zero-capacity channel locked a mutex on every process call): see
+    /// [`state::RestoreMailbox`].
+    restores: state::RestoreMailbox<state::PendingRestore<P>>,
 
     // We'll query all of the host's extensions upfront
     host_callback: ClapPtr<clap_host>,
@@ -483,6 +492,78 @@ impl<P: ClapPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
     }
 }
 
+/// The raw transport segment from a CLAP transport block: the call's own, or an in-stream
+/// transport event at sample `start_frame`. The gated fields the host did not flag read as zero;
+/// `raw` keeps every value the block carried, flagged or not, with the block's own flag word
+/// (T1 round-3). CLAP carries `tempo_inc` together with the tempo.
+fn host_segment_from_clap(
+    transport: *const clap_event_transport,
+    start_frame: u32,
+    from_event: bool,
+) -> HostSegment {
+    if transport.is_null() {
+        return HostSegment {
+            start_frame,
+            from_event,
+            ..HostSegment::ABSENT
+        };
+    }
+
+    // SAFETY: a non-null transport pointer from the host's process struct or input event list,
+    // valid for the duration of the process call.
+    let transport = unsafe { &*transport };
+    let has = |flag| transport.flags & flag != 0;
+    let raw = HostSegmentRaw {
+        flags: transport.flags,
+        tempo: transport.tempo,
+        tempo_increment: transport.tempo_inc,
+        beats: transport.song_pos_beats as f64 / CLAP_BEATTIME_FACTOR as f64,
+        seconds: transport.song_pos_seconds as f64 / CLAP_SECTIME_FACTOR as f64,
+        samples: 0,
+        bar_start: transport.bar_start as f64 / CLAP_BEATTIME_FACTOR as f64,
+        time_sig_numerator: transport.tsig_num as i32,
+        time_sig_denominator: transport.tsig_denom as i32,
+    };
+    let valid = HostSegmentValidity {
+        tempo: has(CLAP_TRANSPORT_HAS_TEMPO),
+        tempo_increment: has(CLAP_TRANSPORT_HAS_TEMPO),
+        beats: has(CLAP_TRANSPORT_HAS_BEATS_TIMELINE),
+        seconds: has(CLAP_TRANSPORT_HAS_SECONDS_TIMELINE),
+        samples: false,
+        bar_start: has(CLAP_TRANSPORT_HAS_BEATS_TIMELINE),
+        time_signature: has(CLAP_TRANSPORT_HAS_TIME_SIGNATURE),
+    };
+
+    HostSegment {
+        start_frame,
+        from_event,
+        playing: has(CLAP_TRANSPORT_IS_PLAYING),
+        preroll: has(CLAP_TRANSPORT_IS_WITHIN_PRE_ROLL),
+        valid,
+        tempo: if valid.tempo { raw.tempo } else { 0.0 },
+        tempo_increment: if valid.tempo_increment {
+            raw.tempo_increment
+        } else {
+            0.0
+        },
+        beats: if valid.beats { raw.beats } else { 0.0 },
+        seconds: if valid.seconds { raw.seconds } else { 0.0 },
+        samples: 0,
+        bar_start: if valid.bar_start { raw.bar_start } else { 0.0 },
+        time_sig_numerator: if valid.time_signature {
+            raw.time_sig_numerator
+        } else {
+            0
+        },
+        time_sig_denominator: if valid.time_signature {
+            raw.time_sig_denominator
+        } else {
+            0
+        },
+        raw,
+    }
+}
+
 impl<P: ClapPlugin> Wrapper<P> {
     /// # Safety
     ///
@@ -490,10 +571,6 @@ impl<P: ClapPlugin> Wrapper<P> {
     pub unsafe fn new(host_callback: *const clap_host) -> Arc<Self> {
         let mut plugin = P::default();
         let task_executor = Mutex::new(plugin.task_executor());
-
-        // This is used to allow the plugin to restore preset data from its editor, see the comment
-        // on `Self::updated_state_sender`
-        let (updated_state_sender, updated_state_receiver) = channel::bounded(0);
 
         let plugin_descriptor: Box<PluginDescriptor> =
             Box::new(PluginDescriptor::for_plugin::<P>());
@@ -615,6 +692,8 @@ impl<P: ClapPlugin> Wrapper<P> {
             current_process_mode: AtomicCell::new(ProcessMode::Realtime),
             input_events: AtomicRefCell::new(VecDeque::with_capacity(P::INPUT_EVENT_CAPACITY)),
             last_process_status: AtomicCell::new(ProcessStatus::Normal),
+            host_call_serial: AtomicU64::new(0),
+            in_call: AtomicBool::new(false),
             latency_changed: AtomicBool::new(false),
             current_latency: AtomicU32::new(0),
             // This is initialized just before calling `Plugin::activate()` so that during the
@@ -623,8 +702,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                 0,
                 AudioIOLayout::default(),
             )),
-            updated_state_sender,
-            updated_state_receiver,
+            restores: state::RestoreMailbox::new(),
 
             host_callback,
 
@@ -843,6 +921,7 @@ impl<P: ClapPlugin> Wrapper<P> {
     fn make_process_context(
         &self,
         transport: Transport,
+        host_call: HostCall,
         total_buffer_len: usize,
         current_sample_idx: usize,
         host_out_events: *const clap_output_events,
@@ -851,6 +930,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             wrapper: self,
             input_events_guard: self.input_events.borrow_mut(),
             transport,
+            host_call,
             total_buffer_len: total_buffer_len as u32,
             current_sample_idx: current_sample_idx as u32,
             host_out_events,
@@ -1489,55 +1569,149 @@ impl<P: ClapPlugin> Wrapper<P> {
         }
     }
 
+    /// The pristine signature (T1 maintainer fix): a caller that never heard of
+    /// [`StateRefusal`] still compiles against this fork unchanged. Discards the refusal after
+    /// logging it, like [`GuiContextInner::set_state()`][crate::context::gui::GuiContextInner::set_state()]
+    /// already does for [`try_set_state_object_from_gui()`][Self::try_set_state_object_from_gui()].
+    pub fn set_state_object_from_gui(&self, state: PluginState) {
+        if let Err(refusal) = self.try_set_state_object_from_gui(state) {
+            crate::nice_error!(
+                "Refused to restore state: {} (detail {})",
+                refusal.reason,
+                refusal.detail
+            );
+        }
+    }
+
     /// Update the plugin's internal state, called by the plugin itself from the GUI thread. To
     /// prevent corrupting data and changing parameters during processing the actual state is only
-    /// updated at the end of the audio processing cycle.
-    pub fn set_state_object_from_gui(&self, mut state: PluginState) {
-        let mut did_set_state_inner = false;
+    /// updated at the end of the audio processing cycle. Returns the plugin's refusal, if any
+    /// (see [`Plugin::ATOMIC_STATE_RESTORE`]); nothing is written then.
+    pub fn try_set_state_object_from_gui(&self, state: PluginState) -> Result<(), StateRefusal> {
+        self.restore_state_object(state, RestoreOrigin::Gui)
+    }
 
-        // Use a loop and timeouts to handle the super rare edge case when this function gets called
-        // between a process call and the host disabling the plugin
-        loop {
-            if self.is_processing.load(Ordering::SeqCst) {
-                // If the plugin is currently processing audio, then we'll perform the restore
-                // operation at the end of the audio call. This involves sending the state to the
-                // audio thread, having the audio thread handle the state restore at the very end of
-                // the process function, and then sending the state back to this thread so it can be
-                // deallocated without blocking the audio thread.
-                match self
-                    .updated_state_sender
-                    .send_timeout(state, Duration::from_secs(1))
-                {
-                    Ok(_) => {
-                        // As mentioned above, the state object will be passed back to this thread
-                        // so we can deallocate it without blocking.
-                        let state = self.updated_state_receiver.recv();
-                        drop(state);
-                        break;
-                    }
-                    Err(SendTimeoutError::Timeout(value)) => {
-                        state = value;
-                        continue;
-                    }
-                    Err(SendTimeoutError::Disconnected(_)) => {
-                        crate::nice_debug_assert_failure!("State update channel got disconnected");
-                        return;
-                    }
+    /// Restore a state object from the host or the GUI. While the plugin is processing, a GUI
+    /// restore (and, under [`Plugin::ATOMIC_STATE_RESTORE`], a host load as well) is handed to
+    /// the audio thread, which commits it at the end of its process call and hands the object
+    /// back with the outcome; otherwise the calling thread commits it right here.
+    ///
+    /// `Plugin::filter_state()` and, under the atomic contract, `Plugin::prepare_fields()` both
+    /// run right here, off the audio thread, before any threading decision (T1 maintainer fix):
+    /// whichever thread ends up committing only has to call `commit_restore()`.
+    ///
+    /// One restore at a time (T1 round-3 fix): a second restoring thread waits up to a second for
+    /// the first to finish and is refused with [`StateRefusal::BUSY`] otherwise, nothing written.
+    /// Everything the audio thread used to do besides the commit itself -- the hand-back, posting
+    /// `Task::StateChanged`, the unknown-parameter warning -- happens here, on this thread.
+    pub fn restore_state_object(
+        &self,
+        mut state: PluginState,
+        origin: RestoreOrigin,
+    ) -> Result<(), StateRefusal> {
+        let (outcome, committed_on_audio) = {
+            // Under the atomic contract one restore at a time (T1 round-3 fix): a second restoring
+            // thread waits up to a second for the first, then is refused with nothing written.
+            // A plugin without the contract keeps the pinned behaviour (T1 round-4 fix): its
+            // restorers only queue for the mailbox, below, and never get refused.
+            let _atomic_restorer = if P::ATOMIC_STATE_RESTORE {
+                match self.restores.restorer(Some(Duration::from_secs(1))) {
+                    Some(guard) => Some(guard),
+                    None => return Err(StateRefusal::BUSY),
                 }
             } else {
-                // Otherwise we'll set the state right here and now, since this function should be
-                // called from a GUI thread
-                self.set_state_inner(&mut state);
-                did_set_state_inner = true;
-                break;
-            }
-        }
+                None
+            };
 
-        if !did_set_state_inner {
-            // After the state has been updated, notify the host about the new parameter values
+            let prepared: Box<dyn PreparedFields<P>> = if P::ATOMIC_STATE_RESTORE {
+                // Off the audio thread, before any threading decision (T1 maintainer fix)
+                P::filter_state(&mut state);
+                state::report_unknown_params(
+                    &state,
+                    state::make_params_getter(&self.param_by_hash, &self.param_id_to_hash),
+                );
+                P::prepare_fields(&state.fields)
+            } else {
+                // As pinned: `filter_state()` runs on the committing thread, in
+                // `state::deserialize_object()` (T1 round-4 fix)
+                Box::new(NoFields)
+            };
+            let mut pending = state::PendingRestore {
+                state,
+                origin,
+                outcome: Ok(()),
+                prepared,
+            };
+            let mut via_audio = origin == RestoreOrigin::Gui || P::ATOMIC_STATE_RESTORE;
+
+            // Use a loop and timeouts to handle the super rare edge case when this function gets
+            // called between a process call and the host disabling the plugin
+            loop {
+                if via_audio && self.is_processing.load(Ordering::SeqCst) {
+                    // If the plugin is currently processing audio, then we'll perform the restore
+                    // operation at the end of the audio call: the audio thread commits it in place
+                    // and this thread takes it back, with its outcome, and frees it. Without the
+                    // atomic contract a second restorer waits here for the mailbox for as long as
+                    // the first needs it, as the pinned shared channel made it wait.
+                    let _restorer = if P::ATOMIC_STATE_RESTORE {
+                        None
+                    } else {
+                        self.restores.restorer(None)
+                    };
+                    match self
+                        .restores
+                        .hand_to_audio(pending, Some(Duration::from_secs(1)))
+                    {
+                        Ok(returned) => break (returned.outcome, true),
+                        Err(untaken) => {
+                            pending = untaken;
+                            // A host load must not wait on a processing loop that is not running
+                            // (some hosts keep a bypassed plugin "processing" without calling it):
+                            // commit it on this thread after all. Under the atomic contract a GUI
+                            // restore too (T1 round-5 fix): only a call with audio commits on the
+                            // audio thread, so while only buffer-less calls run nothing else
+                            // would; and this thread's commit is safe while processing, since it
+                            // takes the plugin's lock and never lands inside a call.
+                            if origin == RestoreOrigin::Host || P::ATOMIC_STATE_RESTORE {
+                                via_audio = false;
+                            }
+                            continue;
+                        }
+                    }
+                } else {
+                    // Otherwise we'll set the state right here and now, on the calling thread --
+                    // unless a process call is between two of its slices (T1 round-4 fix): then
+                    // the call's own end commits it, through the mailbox, like any audio-thread
+                    // restore.
+                    let restore = RestoreContext {
+                        origin,
+                        thread: RestoreThread::Caller,
+                    };
+                    match self.commit_restore(&mut pending.state, &*pending.prepared, restore) {
+                        Err(refusal) if refusal == state::CALL_IN_FLIGHT => {
+                            via_audio = true;
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                            continue;
+                        }
+                        outcome => break (outcome, false),
+                    }
+                }
+            }
+        };
+
+        if committed_on_audio && outcome.is_ok() {
+            // Under the atomic contract the audio thread posts nothing itself (T1 round-3 fix):
+            // reinitialize the editor's view of the state from here. Without it the audio thread
+            // already posted it, as pinned. Then have the host rescan the parameter values.
+            if P::ATOMIC_STATE_RESTORE {
+                let task_posted = self.schedule_gui(Task::StateChanged);
+                crate::nice_debug_assert!(task_posted, "The task queue is full, dropping task...");
+            }
             let task_posted = self.schedule_gui(Task::RescanParamValues);
             crate::nice_debug_assert!(task_posted, "The task queue is full, dropping task...");
-        } // Else the RescanParamValues task has already been sent
+        } // Else the RescanParamValues task has already been sent, or nothing changed
+
+        outcome
     }
 
     pub fn set_latency_samples(&self, samples: u32) {
@@ -1632,42 +1806,116 @@ impl<P: ClapPlugin> Wrapper<P> {
         });
     }
 
-    /// Immediately set the plugin state. Returns `false` if the deserialization failed. The plugin
-    /// state is set from a couple places, so this function aims to deduplicate that. Includes
-    /// `permit_alloc()`s around the deserialization and initialization for the use case where
-    /// `set_state_object_from_gui()` was called while the plugin is process audio.
+    /// The pristine signature (T1 maintainer fix): a caller using only what the framework
+    /// exposed before this delta still compiles and still gets a correct restore. Stages fields
+    /// itself, on whichever thread calls this, so call it off the audio thread; the normal path
+    /// (`restore_state_object()`) stages them before any threading decision instead.
+    pub fn set_state_inner(&self, state: &mut PluginState) -> bool {
+        let prepared: Box<dyn PreparedFields<P>> = if P::ATOMIC_STATE_RESTORE {
+            P::filter_state(state);
+            P::prepare_fields(&state.fields)
+        } else {
+            // `filter_state()` runs in `state::deserialize_object()`, as pinned
+            Box::new(NoFields)
+        };
+        let restore = RestoreContext {
+            origin: RestoreOrigin::Gui,
+            thread: RestoreThread::Caller,
+        };
+        self.commit_restore(state, &*prepared, restore).is_ok()
+    }
+
+    /// The atomic commit with the plugin already held by the caller (T1 round-4 fix; pool
+    /// round-4 terra): a process call commits a restore handed to it inside its last slice, under
+    /// that slice's own plugin guard, so the audio thread takes no lock of its own for it. Posts
+    /// nothing; the restoring thread does (T1 round-3 fix).
+    pub fn commit_restore_holding(
+        &self,
+        plugin: &mut P,
+        state: &mut PluginState,
+        prepared: &dyn PreparedFields<P>,
+        restore: RestoreContext,
+    ) -> Result<(), StateRefusal> {
+        let params_getter = state::make_params_getter(&self.param_by_hash, &self.param_id_to_hash);
+        let buffer_config = self.current_buffer_config.load();
+        unsafe {
+            state::commit_atomic_restore::<P>(
+                state,
+                plugin,
+                params_getter,
+                buffer_config.as_ref(),
+                prepared,
+                restore,
+            )
+        }
+    }
+
+    /// Immediately set the plugin state. Returns the plugin's refusal if it would not accept the
+    /// state (see [`Plugin::ATOMIC_STATE_RESTORE`]), in which case nothing was written. The
+    /// plugin state is set from a couple places, so this function aims to deduplicate that.
+    /// Without the atomic contract this includes a `permit_alloc()` around the deserialization
+    /// for the use case where `set_state_object_from_gui()` was called while the plugin is
+    /// processing audio. `prepared` was already built off the audio thread by
+    /// `Plugin::prepare_fields()` (T1 maintainer fix, section 8, S-28); under the atomic contract
+    /// it is the only thing that writes persistent fields, so `Params::deserialize_fields()` is
+    /// never reached from here.
     ///
-    /// Implicitly emits `Task::ParameterValuesChanged`.
+    /// Implicitly emits `Task::StateChanged` when committed on the calling thread, or, without the
+    /// atomic contract, wherever it is committed (as pinned). Under the contract, after an
+    /// audio-thread commit the restoring thread posts it instead (T1 round-3 fix), so nothing here
+    /// touches the task queue or the host from the audio thread.
     ///
     /// # Notes
     ///
     /// `self.plugin` must _not_ be locked while calling this function or it will deadlock.
-    pub fn set_state_inner(&self, state: &mut PluginState) -> bool {
-        // FIXME: This is obviously not realtime-safe, but loading presets without doing this
-        //        could lead to inconsistencies. `state::deserialize_object()` normally never
-        //        allocates, but if the plugin has persistent non-parameter data then its
-        //        `deserialize_fields()` implementation may still allocate.
-        let success = permit_alloc(|| unsafe {
-            state::deserialize_object::<P>(
-                state,
-                self.params.clone(),
-                state::make_params_getter(&self.param_by_hash, &self.param_id_to_hash),
-                self.current_buffer_config.load().as_ref(),
-            )
-        });
-        if !success {
-            crate::nice_debug_assert_failure!(
-                "Deserializing plugin state from a state object failed"
-            );
-            return false;
+    pub fn commit_restore(
+        &self,
+        state: &mut PluginState,
+        prepared: &dyn PreparedFields<P>,
+        restore: RestoreContext,
+    ) -> Result<(), StateRefusal> {
+        let params_getter = state::make_params_getter(&self.param_by_hash, &self.param_id_to_hash);
+        let buffer_config = self.current_buffer_config.load();
+        if P::ATOMIC_STATE_RESTORE {
+            // The plugin's hooks see the live instance, so this needs the plugin lock: free
+            // between process calls and while not processing, taken only if the host activates
+            // or deactivates concurrently, in which case nothing is written. Never waited for.
+            let Some(mut plugin) = self.plugin.try_lock() else {
+                return Err(StateRefusal::BUSY);
+            };
+            // Read under the plugin's lock (T1 round-4 fix): a call that is between two slices
+            // raised the flag before its first slice took and released this lock.
+            if restore.thread == RestoreThread::Caller && self.in_call.load(Ordering::SeqCst) {
+                return Err(state::CALL_IN_FLIGHT);
+            }
+            self.commit_restore_holding(&mut plugin, state, prepared, restore)?;
+        } else {
+            // FIXME: This is obviously not realtime-safe, but loading presets without doing this
+            //        could lead to inconsistencies. `state::deserialize_object()` normally never
+            //        allocates, but if the plugin has persistent non-parameter data then its
+            //        `deserialize_fields()` implementation may still allocate.
+            permit_alloc(|| unsafe {
+                state::deserialize_object::<P>(
+                    state,
+                    None,
+                    self.params.clone(),
+                    params_getter,
+                    buffer_config.as_ref(),
+                    restore,
+                )
+            })?;
         }
 
         // Reinitialize the plugin after loading state so it can respond to the new parameter values,
-        // and tell the host to rescan the parameter values.
-        let task_posted = self.schedule_gui(Task::StateChanged);
-        crate::nice_debug_assert!(task_posted, "The task queue is full, dropping task...");
+        // and tell the host to rescan the parameter values. Under the atomic contract from the
+        // calling thread only: after an audio-thread commit, `restore_state_object()` posts this on
+        // the restoring thread. Without the contract wherever the commit runs, as pinned.
+        if restore.thread == RestoreThread::Caller || !P::ATOMIC_STATE_RESTORE {
+            let task_posted = self.schedule_gui(Task::StateChanged);
+            crate::nice_debug_assert!(task_posted, "The task queue is full, dropping task...");
+        }
 
-        success
+        Ok(())
     }
 
     pub fn request_restart(&self) {
@@ -1933,6 +2181,10 @@ impl<P: ClapPlugin> Wrapper<P> {
             // we'll process every incoming event.
             let process = unsafe { &*process };
             let total_buffer_len = process.frames_count as usize;
+            // One serial per host call, shared by every slice below
+            let host_call_serial = wrapper.host_call_serial.fetch_add(1, Ordering::Relaxed) + 1;
+            // In flight until this closure returns, by any path (T1 round-4 fix)
+            let _in_call = state::CallInFlight::enter(&wrapper.in_call);
 
             let current_audio_io_layout = wrapper.current_audio_io_layout.load();
             let has_main_input = current_audio_io_layout.main_input_channels.is_some();
@@ -1949,13 +2201,24 @@ impl<P: ClapPlugin> Wrapper<P> {
             // The host may send new transport information as an event. In that case we'll also
             // split the buffer.
             let mut transport_info = process.transport;
+            // The raw transport segment current at the slice, anchored where the host supplied
+            // it: the call's own transport block at frame 0, or an in-stream transport event at
+            // its own sample. Kept beside the public `Transport`, whose per-slice reconstruction
+            // below is unchanged.
+            let mut host_segment = host_segment_from_clap(transport_info, 0, false);
 
             let result = loop {
+                // Each block's event scan reports the transport event it consumed into this
+                // fresh slot (T1 round-4 fix; pool round-4 codex): an event is an event because
+                // the host put it in the input stream, whatever its address -- even when it is
+                // the very object `process.transport` points at, which comparing addresses with
+                // the call's own block would have missed.
+                let mut event_transport: *const clap_event_transport = std::ptr::null();
                 if !process.in_events.is_null() {
                     let split_result = unsafe {
                         wrapper.handle_in_events_until(
                             &*process.in_events,
-                            &mut transport_info,
+                            &mut event_transport,
                             block_start,
                             total_buffer_len,
                             event_start_idx,
@@ -2002,6 +2265,15 @@ impl<P: ClapPlugin> Wrapper<P> {
                         }
                         None => block_end = total_buffer_len,
                     }
+                }
+
+                if !event_transport.is_null() {
+                    // An in-stream transport event replaced the call's transport: a new segment
+                    // anchored at the event's own sample, with the event's own values. The public
+                    // `Transport` below reads the same event, as pinned.
+                    transport_info = event_transport;
+                    let event_time = unsafe { (*transport_info).header.time };
+                    host_segment = host_segment_from_clap(transport_info, event_time, true);
                 }
 
                 // After processing the events we now know where/if the block should be split, and
@@ -2238,8 +2510,15 @@ impl<P: ClapPlugin> Wrapper<P> {
                         outputs: buffers.aux_outputs,
                     };
 
+                    let host_call = HostCall {
+                        serial: host_call_serial,
+                        frames: process.frames_count,
+                        slice_offset: block_start as u32,
+                        segment: host_segment,
+                    };
                     let mut context = wrapper.make_process_context(
                         transport,
+                        host_call,
                         total_buffer_len,
                         block_start,
                         process.out_events,
@@ -2248,6 +2527,28 @@ impl<P: ClapPlugin> Wrapper<P> {
                     let result = plugin.process(buffers.main_buffer, &mut aux, &mut context);
 
                     wrapper.last_process_status.store(result);
+
+                    // The call's last slice commits a restore handed over under the atomic
+                    // contract, under this slice's own plugin guard (T1 round-4 fix; pool
+                    // round-4 terra): the audio thread takes no lock of its own for it. After all
+                    // of this call's automation, before the next call's events, as before.
+                    if P::ATOMIC_STATE_RESTORE
+                        && block_end == total_buffer_len
+                        && !matches!(result, ProcessStatus::Error(_))
+                    {
+                        wrapper.restores.service(|pending| {
+                            let restore = RestoreContext {
+                                origin: pending.origin,
+                                thread: RestoreThread::Audio,
+                            };
+                            pending.outcome = wrapper.commit_restore_holding(
+                                &mut plugin,
+                                &mut pending.state,
+                                &*pending.prepared,
+                                restore,
+                            );
+                        });
+                    }
                     result
                 } else {
                     ProcessStatus::Normal
@@ -2278,24 +2579,27 @@ impl<P: ClapPlugin> Wrapper<P> {
                 }
             };
 
-            // After processing audio, we'll check if the editor has sent us updated plugin state.
-            // We'll restore that here on the audio thread to prevent changing the values during the
-            // process call and also to prevent inconsistent state when the host also wants to load
-            // plugin state.
-            // FIXME: Zero capacity channels allocate on receiving, find a better alternative that
-            //        doesn't do that
-            let updated_state = permit_alloc(|| wrapper.updated_state_receiver.try_recv());
-            if let Ok(mut state) = updated_state {
-                wrapper.set_state_inner(&mut state);
-
-                // We'll pass the state object back to the GUI thread so deallocation can happen
-                // there without potentially blocking the audio thread
-                if let Err(err) = wrapper.updated_state_sender.send(state) {
-                    crate::nice_debug_assert_failure!(
-                        "Failed to send state object back to GUI thread: {}",
-                        err
-                    );
-                };
+            // After processing audio, we'll check if the editor or the host has handed us a state
+            // to restore. We'll restore that here on the audio thread to prevent changing the
+            // values during the process call and also to prevent inconsistent state when the host
+            // also wants to load plugin state. One atomic load when nothing is pending; the state
+            // is committed in place and freed by the thread that handed it over (T1 round-3 fix:
+            // this used to be a zero-capacity channel's `try_recv()`, which locks a mutex on every
+            // call, under a `permit_alloc`).
+            // A plugin without the atomic contract commits here, as pinned (its commit takes no
+            // plugin lock). Under the contract a call whose last slice held no plugin guard -- a
+            // buffer-less call, which never reaches the plugin -- commits nothing (T1 round-5 fix;
+            // round 4 took a `try_lock()` here): the restore waits for a call with audio, or for
+            // the restoring thread's own one-second fallback.
+            if !P::ATOMIC_STATE_RESTORE {
+                wrapper.restores.service(|pending| {
+                    let restore = RestoreContext {
+                        origin: pending.origin,
+                        thread: RestoreThread::Audio,
+                    };
+                    pending.outcome =
+                        wrapper.commit_restore(&mut pending.state, &*pending.prepared, restore);
+                });
             }
 
             result
@@ -3471,14 +3775,20 @@ impl<P: ClapPlugin> Wrapper<P> {
         }
 
         match unsafe { state::deserialize_json(&read_buffer) } {
-            Some(mut state) => {
-                let success = wrapper.set_state_inner(&mut state);
-                if success {
+            Some(state) => match wrapper.restore_state_object(state, RestoreOrigin::Host) {
+                Ok(()) => {
                     crate::nice_trace!("Loaded state ({} bytes)", read_buffer.len());
+                    true
                 }
-
-                success
-            }
+                Err(refusal) => {
+                    crate::nice_error!(
+                        "Refused to load state: {} (detail {})",
+                        refusal.reason,
+                        refusal.detail
+                    );
+                    false
+                }
+            },
             None => false,
         }
     }
