@@ -331,4 +331,76 @@ mod tests {
         }
         assert!(unsafe { vst3_flush(LAYOUT, &audio.data) });
     }
+
+    #[test]
+    fn review_no_declared_clap_input_rejects_extra_before_access() {
+        let mut audio = ClapAudio::new();
+        assert!(audio.valid());
+        // Zero declared input buses means an empty iteration. An extra reported
+        // bus is invalid even when its pointer is NULL: reject before access.
+        audio.process.audio_inputs_count = 1;
+        assert!(!audio.valid());
+        audio.process.audio_inputs_count = 0;
+        assert!(audio.valid());
+    }
+
+    #[test]
+    fn review_aux_only_clap_uses_each_declared_channel_count() {
+        const AUX: &[NonZeroU32] = &[new_nonzero_u32(4), new_nonzero_u32(2)];
+        const LAYOUT: AudioIOLayout = AudioIOLayout {
+            main_input_channels: None,
+            main_output_channels: None,
+            aux_input_ports: &[],
+            aux_output_ports: AUX,
+            names: PortNames::const_default(),
+        };
+        let mut samples = Box::new([[0.0_f32; 8]; 6]);
+        let mut pointers = [std::ptr::null_mut(); 6];
+        for (p, samples) in pointers.iter_mut().zip(samples.iter_mut()) {
+            *p = samples.as_mut_ptr();
+        }
+        let mut buses: [clap_audio_buffer; 2] = unsafe { std::mem::zeroed() };
+        buses[0].channel_count = 4;
+        buses[0].data32 = pointers.as_mut_ptr();
+        buses[1].channel_count = 2;
+        buses[1].data32 = unsafe { pointers.as_mut_ptr().add(4) };
+        let mut process: clap_process = unsafe { std::mem::zeroed() };
+        process.frames_count = 4;
+        process.audio_outputs_count = 2;
+        process.audio_outputs = buses.as_mut_ptr();
+        assert!(unsafe { clap_valid(LAYOUT, &process, 1, 8) });
+        buses[0].channel_count = 2;
+        process.audio_outputs = buses.as_mut_ptr();
+        assert!(!unsafe { clap_valid(LAYOUT, &process, 1, 8) });
+        process.audio_outputs_count = 1;
+        assert!(!unsafe { clap_valid(LAYOUT, &process, 1, 8) });
+    }
+
+    #[cfg(feature = "vst3")]
+    #[test]
+    fn review_aux_only_vst_input_count_is_independent() {
+        const INPUT: &[NonZeroU32] = &[new_nonzero_u32(2)];
+        const LAYOUT: AudioIOLayout = AudioIOLayout {
+            main_input_channels: None,
+            main_output_channels: None,
+            aux_input_ports: INPUT,
+            aux_output_ports: &[],
+            names: PortNames::const_default(),
+        };
+        let mut audio = VstAudio::new();
+        audio.data.inputs = audio.buffers.as_mut_ptr();
+        audio.data.numInputs = 1;
+        audio.data.outputs = std::ptr::null_mut();
+        audio.data.numOutputs = 0;
+        let inputs = [AtomicBool::new(true)];
+        assert!(unsafe { vst3_valid(LAYOUT, &audio.data, &inputs, &[], 8) });
+        let with_main = AudioIOLayout {
+            main_output_channels: Some(new_nonzero_u32(2)),
+            ..LAYOUT
+        };
+        let outputs = [AtomicBool::new(true)];
+        assert!(!unsafe { vst3_valid(with_main, &audio.data, &inputs, &outputs, 8) });
+        audio.data.numInputs = 0;
+        assert!(!unsafe { vst3_valid(LAYOUT, &audio.data, &inputs, &[], 8) });
+    }
 }
