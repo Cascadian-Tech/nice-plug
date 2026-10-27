@@ -87,7 +87,7 @@ fn inactive_main_keeps_active_input_for_other_outputs() {
 
 #[test]
 fn invalid_slice_window_is_rejected_before_any_mapping() {
-    let mut manager = BufferManager::for_audio_io_layout(8, LAYOUT);
+    let mut manager = BufferManager::for_audio_io_layout(8, AudioIOLayout::default());
     assert!(unsafe { manager.try_create_buffers(7, 2, |_| {}) }.is_none());
     assert!(unsafe { manager.try_create_buffers(usize::MAX, 2, |_| {}) }.is_none());
     assert!(unsafe { manager.try_create_buffers(0, 9, |_| {}) }.is_none());
@@ -97,6 +97,7 @@ fn invalid_slice_window_is_rejected_before_any_mapping() {
 fn valid_in_place_main_input_is_preserved() {
     let layout = AudioIOLayout {
         main_input_channels: Some(new_nonzero_u32(2)),
+        aux_output_ports: &[],
         ..LAYOUT
     };
     let mut manager = BufferManager::for_audio_io_layout(8, layout);
