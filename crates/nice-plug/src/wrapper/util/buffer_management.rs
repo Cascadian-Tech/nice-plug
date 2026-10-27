@@ -1,5 +1,7 @@
 //! Helpers for safely constructing [`Buffer`]s from a plugin host's audio buffers.
 
+pub(crate) mod admission;
+
 use std::num::NonZeroU32;
 use std::ptr::NonNull;
 
