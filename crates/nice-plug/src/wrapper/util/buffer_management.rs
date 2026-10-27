@@ -192,6 +192,7 @@ impl BufferManager {
     ///
     /// Any provided `ChannelPointers` must point to memory regions that remain valid to read from
     /// or write to for the lifetime of the returned [`Buffers`].
+    #[cfg(any(feature = "standalone", test))]
     pub unsafe fn create_buffers<'a, 'buffer: 'a>(
         &'a mut self,
         sample_offset: usize,
