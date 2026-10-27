@@ -72,6 +72,16 @@ pub struct ChannelPointers {
 }
 
 impl BufferManager {
+    // Test-first API stub: the recorded red window tests must fail before implementation.
+    pub unsafe fn try_create_buffers<'a, 'buffer: 'a>(
+        &'a mut self,
+        sample_offset: usize,
+        num_samples: usize,
+        set_buffer_sources: impl FnOnce(&mut BufferSource),
+    ) -> Option<Buffers<'a, 'buffer>> {
+        Some(unsafe { self.create_buffers(sample_offset, num_samples, set_buffer_sources) })
+    }
+
     /// Initialize managed buffers for a specific audio IO layout. The actual buffers can be set up
     /// using channel pointer data using [`create_buffers()`][Self::create_buffers()].
     pub fn for_audio_io_layout(max_buffer_size: usize, audio_io_layout: AudioIOLayout) -> Self {
@@ -524,3 +534,7 @@ mod miri {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "buffer_management/codex_admission_regression.rs"]
+mod codex_admission_regression;
