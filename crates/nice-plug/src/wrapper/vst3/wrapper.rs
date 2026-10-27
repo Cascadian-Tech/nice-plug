@@ -367,12 +367,10 @@ impl<P: Vst3Plugin> IComponentTrait for Wrapper<P> {
         type_: vst3::Steinberg::Vst::MediaType,
         dir: vst3::Steinberg::Vst::BusDirection,
         index: int32,
-        _state: TBool,
+        state: TBool,
     ) -> tresult {
         let current_audio_io_layout = self.inner.current_audio_io_layout.load();
 
-        // We don't support this, but the validator will get very angry with us if we let it know
-        // that
         match (type_, dir, index) {
             (t, d, _) if t == K_MEDIA_TYPE_AUDIO && d == K_BUS_DIRECTION_INPUT => {
                 let main_busses = if current_audio_io_layout.main_input_channels.is_some() {
@@ -383,7 +381,12 @@ impl<P: Vst3Plugin> IComponentTrait for Wrapper<P> {
                 let aux_busses = current_audio_io_layout.aux_input_ports.len() as i32;
 
                 if (0..main_busses + aux_busses).contains(&index) {
-                    kResultOk
+                    if let Some(active) = self.inner.active_input_buses.get(index as usize) {
+                        active.store(state != 0, Ordering::Release);
+                        kResultOk
+                    } else {
+                        kInvalidArgument
+                    }
                 } else {
                     kInvalidArgument
                 }
@@ -397,7 +400,12 @@ impl<P: Vst3Plugin> IComponentTrait for Wrapper<P> {
                 let aux_busses = current_audio_io_layout.aux_output_ports.len() as i32;
 
                 if (0..main_busses + aux_busses).contains(&index) {
-                    kResultOk
+                    if let Some(active) = self.inner.active_output_buses.get(index as usize) {
+                        active.store(state != 0, Ordering::Release);
+                        kResultOk
+                    } else {
+                        kInvalidArgument
+                    }
                 } else {
                     kInvalidArgument
                 }
@@ -1088,12 +1096,17 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
         process_wrapper(|| {
             // We need to handle incoming automation first
             let data = unsafe { &*data };
-            let sample_rate = self
-                .inner
-                .current_buffer_config
-                .load()
-                .expect("Process call without prior setup call")
-                .sample_rate;
+            let Some(config) = self.inner.current_buffer_config.load() else {
+                return kResultFalse;
+            };
+            let sample_rate = config.sample_rate;
+            if data.numSamples < 0
+                || data.numInputs < 0
+                || data.numOutputs < 0
+                || data.symbolicSampleSize != K_SYMBOLIC_SAMPLE_SIZE_32
+            {
+                return kResultFalse;
+            }
 
             crate::nice_debug_assert!(data.numInputs >= 0 && data.numOutputs >= 0);
             crate::nice_debug_assert_eq!(data.symbolicSampleSize, K_SYMBOLIC_SAMPLE_SIZE_32);
@@ -1114,16 +1127,24 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
             let aux_input_start_idx = if has_main_input { 1 } else { 0 };
             let aux_output_start_idx = if has_main_output { 1 } else { 0 };
 
-            // NOTE: VST3 hosts may trigger a 'parameter flush' by calling the process function for
-            //       0 input samples. If this is the case then we'll only handle events and skip all
-            //       audio processing. Some hosts, like Ableton Live, implement this in a broken way
-            //       and instead only set the number of channels to 0. In that case the
-            //       'buffer_is_valid' check from below should still prevent audio processing.
-            let mut is_param_flush = total_buffer_len == 0;
-            if (data.numOutputs == 0 || data.outputs.is_null())
-                && (has_main_output || !current_audio_io_layout.aux_output_ports.is_empty())
+            let is_param_flush = unsafe {
+                crate::wrapper::util::buffer_management::admission::vst3_flush(
+                    current_audio_io_layout,
+                    data,
+                )
+            };
+            if !is_param_flush
+                && !unsafe {
+                    crate::wrapper::util::buffer_management::admission::vst3_valid(
+                        current_audio_io_layout,
+                        data,
+                        &self.inner.active_input_buses,
+                        &self.inner.active_output_buses,
+                        config.max_buffer_size,
+                    )
+                }
             {
-                is_param_flush = true;
+                return kResultFalse;
             }
 
             // If `P::SAMPLE_ACCURATE_AUTOMATION` is set, then we'll split up the audio buffer into
@@ -1449,12 +1470,13 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                     // The buffer manager preallocated buffer slices for all the IO and storage for
                     // any axuiliary inputs.
                     let mut buffer_manager = self.inner.buffer_manager.borrow_mut();
-                    let buffers = unsafe {
-                        buffer_manager.create_buffers(block_start, block_len, |buffer_source| {
+                    let Some(buffers) = (unsafe {
+                        buffer_manager.try_create_buffers(block_start, block_len, |buffer_source| {
                             if data.numOutputs > 0
                                 && !data.outputs.is_null()
                                 && !(*data.outputs).__field0.channelBuffers32.is_null()
                                 && has_main_output
+                                && self.inner.active_output_buses[0].load(Ordering::Acquire)
                             {
                                 let audio_output = &*data.outputs;
                                 let ptrs =
@@ -1469,6 +1491,7 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                                 && !data.inputs.is_null()
                                 && !(*data.inputs).__field0.channelBuffers32.is_null()
                                 && has_main_input
+                                && self.inner.active_input_buses[0].load(Ordering::Acquire)
                             {
                                 let audio_input = &*data.inputs;
                                 let ptrs =
@@ -1486,10 +1509,15 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                                     .enumerate()
                                 {
                                     let aux_input_idx = aux_input_no + aux_input_start_idx;
-                                    if aux_input_idx > data.numOutputs as usize {
+                                    if aux_input_idx >= data.numInputs as usize {
                                         break;
                                     }
 
+                                    if !self.inner.active_input_buses[aux_input_idx]
+                                        .load(Ordering::Acquire)
+                                    {
+                                        continue;
+                                    }
                                     let audio_input = &*data.inputs.add(aux_input_idx);
                                     match NonNull::new(audio_input.__field0.channelBuffers32) {
                                         Some(ptrs) => {
@@ -1510,10 +1538,15 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                                     .enumerate()
                                 {
                                     let aux_output_idx = aux_output_no + aux_output_start_idx;
-                                    if aux_output_idx > data.numOutputs as usize {
+                                    if aux_output_idx >= data.numOutputs as usize {
                                         break;
                                     }
 
+                                    if !self.inner.active_output_buses[aux_output_idx]
+                                        .load(Ordering::Acquire)
+                                    {
+                                        continue;
+                                    }
                                     let audio_output = &*data.outputs.add(aux_output_idx);
                                     match NonNull::new(audio_output.__field0.channelBuffers32) {
                                         Some(ptrs) => {
@@ -1527,6 +1560,8 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                                 }
                             }
                         })
+                    }) else {
+                        return kResultFalse;
                     };
 
                     // We already checked whether the host has initiated a parameter flush, but in

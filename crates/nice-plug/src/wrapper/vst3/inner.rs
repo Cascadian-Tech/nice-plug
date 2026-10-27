@@ -100,6 +100,9 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
     /// IO layout is chosen as the default. Because of the way VST3 works it's not possible to
     /// change the number of busses from that default, only the channel counts can change.
     pub current_audio_io_layout: AtomicCell<AudioIOLayout>,
+    /// SDK activation state, independent of declarations and reset/processing state.
+    pub active_input_buses: Vec<AtomicBool>,
+    pub active_output_buses: Vec<AtomicBool>,
     /// The current buffer configuration, containing the sample rate and the maximum block size.
     /// Will be set in `IAudioProcessor::setupProcessing()`.
     pub current_buffer_config: AtomicCell<Option<BufferConfig>>,
@@ -359,6 +362,25 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             current_audio_io_layout: AtomicCell::new(
                 P::AUDIO_IO_LAYOUTS.first().copied().unwrap_or_default(),
             ),
+            active_input_buses: (0..P::AUDIO_IO_LAYOUTS
+                .iter()
+                .map(|layout| {
+                    usize::from(layout.main_input_channels.is_some()) + layout.aux_input_ports.len()
+                })
+                .max()
+                .unwrap_or(0))
+                .map(|_| AtomicBool::new(true))
+                .collect(),
+            active_output_buses: (0..P::AUDIO_IO_LAYOUTS
+                .iter()
+                .map(|layout| {
+                    usize::from(layout.main_output_channels.is_some())
+                        + layout.aux_output_ports.len()
+                })
+                .max()
+                .unwrap_or(0))
+                .map(|_| AtomicBool::new(true))
+                .collect(),
             current_buffer_config: AtomicCell::new(None),
             current_process_mode: AtomicCell::new(ProcessMode::Realtime),
             #[cfg(feature = "editor")]

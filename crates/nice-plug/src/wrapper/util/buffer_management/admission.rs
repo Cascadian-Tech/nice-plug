@@ -1,33 +1,155 @@
 //! Protocol admission before the buffer manager creates any sample slice.
-use clap_sys::process::clap_process;
+use clap_sys::{audio_buffer::clap_audio_buffer, process::clap_process};
 use nice_plug_core::audio_setup::AudioIOLayout;
+use std::num::NonZeroU32;
 #[cfg(feature = "vst3")]
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "vst3")]
-use vst3::Steinberg::Vst::ProcessData;
+use vst3::Steinberg::Vst::{AudioBusBuffers, ProcessData};
 
-// Test-first stubs: reject-shape regressions must fail before these are implemented.
-pub(crate) unsafe fn clap_valid(
-    _layout: AudioIOLayout,
-    _process: &clap_process,
-    _min: u32,
-    _max: u32,
+fn bus_count(main: Option<NonZeroU32>, auxiliary: &[NonZeroU32]) -> usize {
+    usize::from(main.is_some()) + auxiliary.len()
+}
+fn bus_channels(main: Option<NonZeroU32>, auxiliary: &[NonZeroU32], index: usize) -> usize {
+    if let Some(main) = main
+        && index == 0
+    {
+        return main.get() as usize;
+    }
+    auxiliary[index - usize::from(main.is_some())].get() as usize
+}
+unsafe fn samples_valid(pointers: *mut *mut f32, channels: usize) -> bool {
+    if pointers.is_null() || !pointers.is_aligned() {
+        return false;
+    }
+    (0..channels).all(|channel| {
+        let pointer = unsafe { *pointers.add(channel) };
+        !pointer.is_null() && pointer.is_aligned()
+    })
+}
+unsafe fn clap_ports_valid(
+    raw: *const clap_audio_buffer,
+    count: u32,
+    main: Option<NonZeroU32>,
+    auxiliary: &[NonZeroU32],
 ) -> bool {
-    true
+    if count as usize != bus_count(main, auxiliary) {
+        return false;
+    }
+    if count > 0 && (raw.is_null() || !raw.is_aligned()) {
+        return false;
+    }
+    (0..count as usize).all(|index| {
+        let bus = unsafe { &*raw.add(index) };
+        let channels = bus_channels(main, auxiliary, index);
+        bus.channel_count as usize == channels && unsafe { samples_valid(bus.data32, channels) }
+    })
+}
+// Callers retain the SDK pointer-array/sample-region allocation and lifetime contract.
+pub(crate) unsafe fn clap_valid(
+    layout: AudioIOLayout,
+    process: &clap_process,
+    min: u32,
+    max: u32,
+) -> bool {
+    process.frames_count >= min
+        && process.frames_count <= max
+        && unsafe {
+            clap_ports_valid(
+                process.audio_inputs,
+                process.audio_inputs_count,
+                layout.main_input_channels,
+                layout.aux_input_ports,
+            )
+        }
+        && unsafe {
+            clap_ports_valid(
+                process.audio_outputs,
+                process.audio_outputs_count,
+                layout.main_output_channels,
+                layout.aux_output_ports,
+            )
+        }
+}
+#[cfg(feature = "vst3")]
+unsafe fn vst_ports_valid(
+    raw: *const AudioBusBuffers,
+    count: i32,
+    main: Option<NonZeroU32>,
+    auxiliary: &[NonZeroU32],
+    active: &[AtomicBool],
+) -> bool {
+    let expected = bus_count(main, auxiliary);
+    if count < 0 || count as usize > expected || active.len() < expected {
+        return false;
+    }
+    if count > 0 && (raw.is_null() || !raw.is_aligned()) {
+        return false;
+    }
+    (0..expected).all(|index| {
+        let active = active[index].load(Ordering::Acquire);
+        if index >= count as usize {
+            return !active;
+        }
+        let bus = unsafe { &*raw.add(index) };
+        let channels = bus_channels(main, auxiliary, index);
+        let pointers = unsafe { bus.__field0.channelBuffers32 };
+        bus.numChannels >= 0
+            && bus.numChannels as usize == channels
+            && !pointers.is_null()
+            && pointers.is_aligned()
+            && (!active || unsafe { samples_valid(pointers, channels) })
+    })
 }
 #[cfg(feature = "vst3")]
 pub(crate) unsafe fn vst3_valid(
-    _layout: AudioIOLayout,
-    _data: &ProcessData,
-    _inputs: &[AtomicBool],
-    _outputs: &[AtomicBool],
-    _max: u32,
+    layout: AudioIOLayout,
+    data: &ProcessData,
+    inputs: &[AtomicBool],
+    outputs: &[AtomicBool],
+    max: u32,
 ) -> bool {
-    true
+    data.numSamples > 0
+        && data.numSamples as u32 <= max
+        && data.symbolicSampleSize == vst3::Steinberg::Vst::SymbolicSampleSizes_::kSample32 as i32
+        && unsafe {
+            vst_ports_valid(
+                data.inputs,
+                data.numInputs,
+                layout.main_input_channels,
+                layout.aux_input_ports,
+                inputs,
+            )
+        }
+        && unsafe {
+            vst_ports_valid(
+                data.outputs,
+                data.numOutputs,
+                layout.main_output_channels,
+                layout.aux_output_ports,
+                outputs,
+            )
+        }
 }
 #[cfg(feature = "vst3")]
-pub(crate) unsafe fn vst3_flush(_layout: AudioIOLayout, _data: &ProcessData) -> bool {
-    false
+pub(crate) unsafe fn vst3_flush(layout: AudioIOLayout, data: &ProcessData) -> bool {
+    if data.numSamples < 0 || data.numInputs < 0 || data.numOutputs < 0 {
+        return false;
+    }
+    if data.numSamples == 0 {
+        return true;
+    }
+    // Uniform zero-channel audio is a separate parameter-only shape. An absent
+    // ordinary pointer array or a single malformed bus must never become flush.
+    let expected = bus_count(layout.main_output_channels, layout.aux_output_ports);
+    if expected == 0
+        || data.numOutputs as usize != expected
+        || data.outputs.is_null()
+        || !data.outputs.is_aligned()
+    {
+        return false;
+    }
+    (0..expected).all(|index| unsafe { (*data.outputs.add(index)).numChannels == 0 })
 }
 
 #[cfg(test)]
