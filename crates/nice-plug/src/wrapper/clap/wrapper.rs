@@ -2191,6 +2191,19 @@ impl<P: ClapPlugin> Wrapper<P> {
             let has_main_output = current_audio_io_layout.main_output_channels.is_some();
             let aux_input_start_idx = if has_main_input { 1 } else { 0 };
             let aux_output_start_idx = if has_main_output { 1 } else { 0 };
+            let Some(config) = wrapper.current_buffer_config.load() else {
+                return CLAP_PROCESS_ERROR;
+            };
+            if !unsafe {
+                crate::wrapper::util::buffer_management::admission::clap_valid(
+                    current_audio_io_layout,
+                    process,
+                    config.min_buffer_size.unwrap_or(1),
+                    config.max_buffer_size,
+                )
+            } {
+                return CLAP_PROCESS_ERROR;
+            }
 
             // If `P::SAMPLE_ACCURATE_AUTOMATION` is set, then we'll split up the audio buffer into
             // chunks whenever a parameter change occurs
@@ -2296,8 +2309,8 @@ impl<P: ClapPlugin> Wrapper<P> {
                 // TODO: The audio buffers have a latency field, should we use those?
                 // TODO: Like with VST3, should we expose some way to access or set the silence/constant
                 //       flags?
-                let buffers = unsafe {
-                    buffer_manager.create_buffers(block_start, block_len, |buffer_source| {
+                let Some(buffers) = (unsafe {
+                    buffer_manager.try_create_buffers(block_start, block_len, |buffer_source| {
                         // Explicitly take plugins with no main output that does have auxiliary
                         // outputs into account. Shouldn't happen, but if we just start copying
                         // audio here then that would result in unsoundness.
@@ -2334,7 +2347,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                                 .enumerate()
                             {
                                 let aux_input_idx = aux_input_no + aux_input_start_idx;
-                                if aux_input_idx > process.audio_inputs_count as usize {
+                                if aux_input_idx >= process.audio_inputs_count as usize {
                                     break;
                                 }
 
@@ -2358,7 +2371,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                                 .enumerate()
                             {
                                 let aux_output_idx = aux_output_no + aux_output_start_idx;
-                                if aux_output_idx > process.audio_outputs_count as usize {
+                                if aux_output_idx >= process.audio_outputs_count as usize {
                                     break;
                                 }
 
@@ -2375,6 +2388,8 @@ impl<P: ClapPlugin> Wrapper<P> {
                             }
                         }
                     })
+                }) else {
+                    return CLAP_PROCESS_ERROR;
                 };
 
                 // If the host does not provide outputs or if it does not provide the required
