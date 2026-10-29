@@ -63,6 +63,7 @@ pub(crate) struct WrapperProcessContext<'a, P: ClapPlugin> {
 #[cfg(feature = "editor")]
 pub(crate) struct WrapperGuiContext<P: ClapPlugin> {
     pub(super) wrapper: std::sync::Weak<Wrapper<P>>,
+    pub(super) dirty_lease: std::sync::Arc<crate::wrapper::dirty::EditorLease>,
     #[cfg(debug_assertions)]
     pub(super) param_gesture_checker:
         atomic_refcell::AtomicRefCell<crate::wrapper::util::context_checks::ParamGestureChecker>,
@@ -528,6 +529,18 @@ impl<P: ClapPlugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
 
 #[cfg(feature = "editor")]
 impl<P: ClapPlugin> nice_plug_core::context::gui::GuiContextInner for WrapperGuiContext<P> {
+    fn mark_non_parameter_state_dirty(&self) -> nice_plug_core::context::gui::DirtyNotification {
+        use nice_plug_core::context::gui::DirtyNotification;
+        // Reject before even upgrading the wrapper: a worker must not release host owners.
+        if !self.dirty_lease.is_live_owner() {
+            return DirtyNotification::Failed;
+        }
+        let Some(wrapper) = self.wrapper.upgrade() else {
+            return DirtyNotification::Failed;
+        };
+        wrapper.notify_non_parameter_dirty(&self.dirty_lease)
+    }
+
     fn plugin_api(&self) -> PluginApi {
         PluginApi::Clap
     }

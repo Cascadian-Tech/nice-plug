@@ -79,6 +79,8 @@ pub(crate) struct WrapperProcessContext<'a, P: Vst3Plugin> {
 #[cfg(feature = "editor")]
 pub(crate) struct WrapperGuiContext<P: Vst3Plugin> {
     pub(super) inner: std::sync::Weak<WrapperInner<P>>,
+    pub(super) dirty_lease: std::sync::Arc<crate::wrapper::dirty::EditorLease>,
+    pub(super) dirty_connection: std::sync::Arc<super::inner::HandlerIdentity>,
     #[cfg(debug_assertions)]
     pub(super) param_gesture_checker:
         atomic_refcell::AtomicRefCell<crate::wrapper::util::context_checks::ParamGestureChecker>,
@@ -387,6 +389,68 @@ impl<P: Vst3Plugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
 
 #[cfg(feature = "editor")]
 impl<P: Vst3Plugin + Send> GuiContextInner for WrapperGuiContext<P> {
+    fn mark_non_parameter_state_dirty(&self) -> nice_plug_core::context::gui::DirtyNotification {
+        use nice_plug_core::context::gui::DirtyNotification as D;
+        use vst3::{
+            ComPtr, Interface,
+            Steinberg::{
+                Vst::{IComponentHandler2, IComponentHandler2Trait},
+                kNoInterface,
+            },
+        };
+        if !self.dirty_lease.is_live_owner() {
+            return D::Failed;
+        }
+        let Some(inner) = self.inner.upgrade() else {
+            return D::Failed;
+        };
+        let live =
+            || self.dirty_lease.is_live_owner() && inner.connection_ready(&self.dirty_connection);
+        if !live() {
+            return D::Failed;
+        }
+        let Some(_in_flight) = crate::wrapper::dirty::InFlight::enter(&inner.dirty_in_flight)
+        else {
+            return D::Failed;
+        };
+        let Some(handler) = inner.snapshot_handler() else {
+            return D::Unsupported;
+        };
+        let mut pointer = std::ptr::null_mut();
+        let raw = handler.handler.as_ptr();
+        let code = unsafe {
+            ((*(*raw).vtbl).base.queryInterface)(
+                raw.cast(),
+                IComponentHandler2::IID.as_ptr().cast(),
+                &mut pointer,
+            )
+        };
+        if code != kResultOk {
+            return if !live() {
+                D::Failed
+            } else if code == kNoInterface {
+                D::Unsupported
+            } else {
+                D::Failed
+            };
+        }
+        let Some(dirty) = (unsafe { ComPtr::<IComponentHandler2>::from_raw(pointer.cast()) })
+        else {
+            return D::Failed;
+        };
+        let result = if !live() {
+            D::Failed
+        } else if unsafe { dirty.setDirty(1) } == kResultOk {
+            D::Notified
+        } else {
+            D::Failed
+        };
+        // Release can reenter too, so it precedes the in-flight guard's drop.
+        drop(dirty);
+        drop(handler);
+        result
+    }
+
     fn plugin_api(&self) -> PluginApi {
         PluginApi::Vst3
     }
@@ -396,10 +460,10 @@ impl<P: Vst3Plugin + Send> GuiContextInner for WrapperGuiContext<P> {
     unsafe fn raw_begin_set_parameter(&self, param: ParamPtr) {
         let inner = self.inner.upgrade().unwrap();
 
-        match &*inner.component_handler.borrow() {
+        match inner.snapshot_handler().as_ref() {
             Some(handler) => match inner.param_ptr_to_hash.get(&param) {
                 Some(hash) => unsafe {
-                    handler.beginEdit(*hash);
+                    handler.handler.beginEdit(*hash);
                 },
                 None => crate::nice_debug_assert_failure!("Unknown parameter: {:?}", param),
             },
@@ -421,7 +485,7 @@ impl<P: Vst3Plugin + Send> GuiContextInner for WrapperGuiContext<P> {
     unsafe fn raw_set_parameter_normalized(&self, param: ParamPtr, normalized: f32) {
         let inner = self.inner.upgrade().unwrap();
 
-        match &*inner.component_handler.borrow() {
+        match inner.snapshot_handler().as_ref() {
             Some(handler) => match inner.param_ptr_to_hash.get(&param) {
                 Some(hash) => {
                     // Only update the parameters manually if the host is not processing audio. If
@@ -442,7 +506,7 @@ impl<P: Vst3Plugin + Send> GuiContextInner for WrapperGuiContext<P> {
                         );
                     }
 
-                    unsafe { handler.performEdit(*hash, normalized as f64) };
+                    unsafe { handler.handler.performEdit(*hash, normalized as f64) };
                 }
                 None => crate::nice_debug_assert_failure!("Unknown parameter: {:?}", param),
             },
@@ -466,10 +530,10 @@ impl<P: Vst3Plugin + Send> GuiContextInner for WrapperGuiContext<P> {
     unsafe fn raw_end_set_parameter(&self, param: ParamPtr) {
         let inner = self.inner.upgrade().unwrap();
 
-        match &*inner.component_handler.borrow() {
+        match inner.snapshot_handler().as_ref() {
             Some(handler) => match inner.param_ptr_to_hash.get(&param) {
                 Some(hash) => unsafe {
-                    handler.endEdit(*hash);
+                    handler.handler.endEdit(*hash);
                 },
                 None => crate::nice_debug_assert_failure!("Unknown parameter: {:?}", param),
             },

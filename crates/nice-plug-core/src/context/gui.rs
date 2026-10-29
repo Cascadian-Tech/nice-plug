@@ -9,6 +9,19 @@ use crate::{
 
 use super::PluginApi;
 
+/// Result of a field-only state change notification to the host.
+///
+/// This describes dispatch, not whether the host has saved a project.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirtyNotification {
+    /// The host callback completed successfully.
+    Notified,
+    /// The live context's host does not provide this operation.
+    Unsupported,
+    /// The context is stale, called on the wrong thread, reentered, or rejected.
+    Failed,
+}
+
 /// Callbacks the plugin can make when the user interacts with its GUI such as updating parameter
 /// values. This is passed to the plugin during [`Editor::spawn()`][crate::editor::Editor::spawn()].
 /// All of these functions assume they're being called from the main GUI thread.
@@ -26,6 +39,15 @@ impl GuiContext {
     /// about screen.
     pub fn plugin_api(&self) -> PluginApi {
         self.inner.plugin_api()
+    }
+
+    /// Notify the host after changing non-parameter persistent state on the UI thread.
+    ///
+    /// This is not a realtime operation. It does not apply state, change a parameter,
+    /// restart processing, or retry. Call only after a real UI edit, never on restore.
+    #[must_use]
+    pub fn mark_non_parameter_state_dirty(&self) -> DirtyNotification {
+        self.inner.mark_non_parameter_state_dirty()
     }
 
     pub fn param_setter<'a>(&'a self) -> ParamSetter<'a> {
@@ -111,6 +133,11 @@ impl GuiContext {
 // The implementing wrapper can assume that everything is being called from the main thread. Since
 // nice-plug doesn't own the GUI event loop, this invariant cannot be part of the interface.
 pub trait GuiContextInner: Send + Sync + 'static {
+    /// Notify the host of a field-only UI edit. Custom contexts default to unsupported.
+    fn mark_non_parameter_state_dirty(&self) -> DirtyNotification {
+        DirtyNotification::Unsupported
+    }
+
     /// Get the current plugin API. This may be useful to display in the plugin's GUI as part of an
     /// about screen.
     fn plugin_api(&self) -> PluginApi;

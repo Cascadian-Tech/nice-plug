@@ -45,6 +45,39 @@ use crate::wrapper::vst3::context::WrapperGuiContext;
 #[cfg(feature = "editor")]
 use crate::wrapper::vst3::view::WrapperView;
 
+/// Identity for one handler connection, without ownership of the host object.
+pub(super) struct HandlerIdentity(std::sync::atomic::AtomicU8);
+impl HandlerIdentity {
+    fn pending() -> Self {
+        Self(std::sync::atomic::AtomicU8::new(0))
+    }
+    fn ready() -> Self {
+        Self(std::sync::atomic::AtomicU8::new(1))
+    }
+    fn invalidate(&self) {
+        self.0.store(2, Ordering::Release);
+    }
+    #[cfg(feature = "editor")]
+    fn is_ready(&self) -> bool {
+        self.0.load(Ordering::Acquire) == 1
+    }
+}
+pub(super) struct HandlerConnection {
+    pub handler: ComPtr<IComponentHandler>,
+}
+struct HandlerSlot {
+    identity: Arc<HandlerIdentity>,
+    handler: Option<Arc<HandlerConnection>>,
+}
+impl HandlerSlot {
+    fn empty() -> Self {
+        Self {
+            identity: Arc::new(HandlerIdentity::ready()),
+            handler: None,
+        }
+    }
+}
+
 /// The actual wrapper bits. We need this as an `Arc<T>` so we can safely use our event loop API.
 /// Since we can't combine that with VST3's interior reference counting this just has to be moved to
 /// its own struct.
@@ -71,7 +104,12 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
 
     /// The host's [`IComponentHandler`] instance, if passed through
     /// [`IEditController::set_component_handler`].
-    pub component_handler: AtomicRefCell<Option<ComPtr<IComponentHandler>>>,
+    component_handler: AtomicRefCell<HandlerSlot>,
+    pub(super) dirty_initialized: AtomicBool,
+    #[cfg(feature = "editor")]
+    pub(super) dirty_in_flight: AtomicBool,
+    #[cfg(feature = "editor")]
+    pub(super) dirty_lease: AtomicRefCell<Option<Arc<crate::wrapper::dirty::EditorLease>>>,
 
     /// Our own [`IPlugView`] instance.
     #[cfg(feature = "editor")]
@@ -344,7 +382,12 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             #[cfg(feature = "editor")]
             editor_window: Arc::new(AtomicRefCell::new(None)),
 
-            component_handler: AtomicRefCell::new(None),
+            component_handler: AtomicRefCell::new(HandlerSlot::empty()),
+            dirty_initialized: AtomicBool::new(false),
+            #[cfg(feature = "editor")]
+            dirty_in_flight: AtomicBool::new(false),
+            #[cfg(feature = "editor")]
+            dirty_lease: AtomicRefCell::new(None),
 
             #[cfg(feature = "editor")]
             plug_view: RwLock::new(None),
@@ -460,10 +503,108 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         wrapper
     }
 
+    pub(super) fn snapshot_handler(&self) -> Option<Arc<HandlerConnection>> {
+        self.component_handler.borrow().handler.clone()
+    }
+
     #[cfg(feature = "editor")]
-    pub fn make_gui_context(self: Arc<Self>) -> GuiContext {
+    pub(super) fn connection_identity(&self) -> Arc<HandlerIdentity> {
+        self.component_handler.borrow().identity.clone()
+    }
+
+    fn identity_current(&self, identity: &Arc<HandlerIdentity>) -> bool {
+        self.dirty_initialized.load(Ordering::Acquire)
+            && identity.0.load(Ordering::Acquire) != 2
+            && Arc::ptr_eq(&self.component_handler.borrow().identity, identity)
+    }
+
+    #[cfg(feature = "editor")]
+    pub(super) fn connection_ready(&self, identity: &Arc<HandlerIdentity>) -> bool {
+        identity.is_ready() && self.identity_current(identity)
+    }
+
+    #[cfg(feature = "editor")]
+    pub(super) fn close_dirty_editor(&self) {
+        let lease = self.dirty_lease.borrow_mut().take();
+        if let Some(lease) = lease {
+            lease.close();
+        }
+    }
+
+    pub(super) fn terminate_dirty(&self) {
+        self.dirty_initialized.store(false, Ordering::Release);
+        #[cfg(feature = "editor")]
+        self.close_dirty_editor();
+        let old = {
+            let mut slot = self.component_handler.borrow_mut();
+            slot.identity.invalidate();
+            let replacement = HandlerSlot::empty();
+            replacement.identity.invalidate();
+            std::mem::replace(&mut *slot, replacement)
+        };
+        // Host Release may reenter; no handler or editor cell is borrowed.
+        drop(old);
+    }
+
+    pub(super) fn initialize_dirty(&self) {
+        self.terminate_dirty();
+        let old = std::mem::replace(
+            &mut *self.component_handler.borrow_mut(),
+            HandlerSlot::empty(),
+        );
+        self.dirty_initialized.store(true, Ordering::Release);
+        drop(old);
+    }
+
+    pub(super) unsafe fn replace_component_handler(&self, handler: *mut IComponentHandler) {
+        if !self.dirty_initialized.load(Ordering::Acquire) {
+            return;
+        }
+        let identity = Arc::new(HandlerIdentity::pending());
+        let old = {
+            let mut slot = self.component_handler.borrow_mut();
+            slot.identity.invalidate();
+            std::mem::replace(
+                &mut *slot,
+                HandlerSlot {
+                    identity: identity.clone(),
+                    handler: None,
+                },
+            )
+        };
+        drop(old);
+        if !self.identity_current(&identity) {
+            return;
+        }
+        let incoming = unsafe { vst3::ComRef::from_raw(handler) }.map(|handler| {
+            Arc::new(HandlerConnection {
+                handler: handler.to_com_ptr(),
+            })
+        });
+        // AddRef may have replaced/disconnected/terminated this instance.
+        if !self.identity_current(&identity) {
+            drop(incoming);
+            return;
+        }
+        let displaced = {
+            let mut slot = self.component_handler.borrow_mut();
+            let old = std::mem::replace(&mut slot.handler, incoming);
+            identity.0.store(1, Ordering::Release);
+            old
+        };
+        drop(displaced);
+    }
+
+    #[cfg(feature = "editor")]
+    pub fn make_gui_context(
+        self: Arc<Self>,
+        dirty_lease: Arc<crate::wrapper::dirty::EditorLease>,
+        dirty_connection: Arc<HandlerIdentity>,
+    ) -> GuiContext {
         GuiContext::new(Arc::new(WrapperGuiContext {
             inner: Arc::downgrade(&self),
+            dirty_lease,
+            dirty_connection,
             #[cfg(debug_assertions)]
             param_gesture_checker: Default::default(),
         }))
@@ -924,10 +1065,10 @@ impl<P: Vst3Plugin> MainThreadExecutor<Task<P>> for WrapperInner<P> {
                         .param_value_changed(param_id, normalized_value);
                 }
             }
-            Task::TriggerRestart(flags) => match &*self.component_handler.borrow() {
+            Task::TriggerRestart(flags) => match self.snapshot_handler().as_ref() {
                 Some(handler) => unsafe {
                     crate::nice_debug_assert!(is_gui_thread);
-                    let result = handler.restartComponent(flags);
+                    let result = handler.handler.restartComponent(flags);
                     crate::nice_debug_assert_eq!(
                         result,
                         kResultOk,

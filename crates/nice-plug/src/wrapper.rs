@@ -5,6 +5,9 @@ pub mod clap;
 pub(crate) mod state;
 pub(crate) mod util;
 
+#[cfg(feature = "editor")]
+pub(crate) mod dirty;
+
 #[cfg(feature = "standalone")]
 pub mod standalone;
 #[cfg(feature = "vst3")]
