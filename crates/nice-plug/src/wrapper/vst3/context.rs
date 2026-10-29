@@ -426,7 +426,9 @@ impl<P: Vst3Plugin + Send> GuiContextInner for WrapperGuiContext<P> {
             )
         };
         if code != kResultOk {
-            return if code == kNoInterface {
+            return if !live() {
+                D::Failed
+            } else if code == kNoInterface {
                 D::Unsupported
             } else {
                 D::Failed
