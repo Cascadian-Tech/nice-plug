@@ -465,8 +465,15 @@ impl<P: Vst3Plugin> IPlugViewTrait for WrapperView<P> {
             return kResultFalse;
         };
 
+        if !inner.dirty_initialized.load(Ordering::Acquire) {
+            return kResultFalse;
+        }
         let mut window = inner.editor_window.borrow_mut();
         if window.is_none() {
+            inner.close_dirty_editor();
+            let lease = Arc::new(crate::wrapper::dirty::EditorLease::preparing());
+            let connection = inner.connection_identity();
+            *inner.dirty_lease.borrow_mut() = Some(lease.clone());
             let parent_handle = if unsafe { fid_matches(type_, kPlatformTypeX11EmbedWindowID) } {
                 #[allow(clippy::unnecessary_cast)]
                 let w = parent as usize as c_ulong;
@@ -494,6 +501,7 @@ impl<P: Vst3Plugin> IPlugViewTrait for WrapperView<P> {
 
             struct Vst3HostCallbacks<P: Vst3Plugin> {
                 inner: Weak<WrapperInner<P>>,
+                lease: Arc<crate::wrapper::dirty::EditorLease>,
             }
 
             impl<P: Vst3Plugin> HostCallbacks for Vst3HostCallbacks<P> {
@@ -522,6 +530,7 @@ impl<P: Vst3Plugin> IPlugViewTrait for WrapperView<P> {
                 }
 
                 fn destroyed(&mut self) {
+                    self.lease.close();
                     // TODO: Does VST3 have a way for a plugin to notify the host that its GUI
                     // has been destroyed?
                 }
@@ -529,6 +538,7 @@ impl<P: Vst3Plugin> IPlugViewTrait for WrapperView<P> {
 
             let callbacks: Box<dyn HostCallbacks> = Box::new(Vst3HostCallbacks {
                 inner: Arc::downgrade(&inner),
+                lease: lease.clone(),
             });
 
             struct Vst3HostMainThreadCaller<P: Vst3Plugin> {
@@ -556,11 +566,13 @@ impl<P: Vst3Plugin> IPlugViewTrait for WrapperView<P> {
 
             let fallback_scale_factor = self.fallback_scale_factor.load().map(|s| s as f64);
 
-            match self.editor.upgrade().unwrap().lock().spawn(
+            let result = match self.editor.upgrade().unwrap().lock().spawn(
                 Some(parent_handle),
                 false,
                 fallback_scale_factor,
-                inner.clone().make_gui_context(),
+                inner
+                    .clone()
+                    .make_gui_context(lease.clone(), connection.clone()),
                 Some(HostMethods {
                     callbacks,
                     main_thread_caller,
@@ -573,14 +585,26 @@ impl<P: Vst3Plugin> IPlugViewTrait for WrapperView<P> {
                         kResultOk
                     }
                     Err(e) => {
+                        lease.close();
                         crate::nice_error!("Failed to show editor: {}", e);
                         kResultFalse
                     }
                 },
                 Err(e) => {
+                    lease.close();
                     crate::nice_error!("Failed to create editor: {}", e);
                     kResultFalse
                 }
+            };
+            drop(window);
+            if result == kResultOk && inner.connection_ready(&connection) && lease.activate() {
+                kResultOk
+            } else {
+                lease.close();
+                inner.is_editor_open.store(false, Ordering::SeqCst);
+                let window = inner.editor_window.borrow_mut().take();
+                drop(window);
+                kResultFalse
             }
         } else {
             #[cfg(debug_assertions)]
@@ -595,10 +619,11 @@ impl<P: Vst3Plugin> IPlugViewTrait for WrapperView<P> {
             return kResultFalse;
         };
 
-        let mut editor_handle = inner.editor_window.borrow_mut();
+        inner.close_dirty_editor();
+        let editor_handle = inner.editor_window.borrow_mut().take();
         if editor_handle.is_some() {
             inner.is_editor_open.store(false, Ordering::SeqCst);
-            *editor_handle = None;
+            drop(editor_handle);
 
             kResultOk
         } else {

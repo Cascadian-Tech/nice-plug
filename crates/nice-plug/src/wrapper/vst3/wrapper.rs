@@ -116,17 +116,19 @@ impl<P: Vst3Plugin> Default for Wrapper<P> {
 
 impl<P: Vst3Plugin> Drop for Wrapper<P> {
     fn drop(&mut self) {
+        self.inner.terminate_dirty();
         crate::nice_debug_assert_eq!(Arc::strong_count(&self.inner), 1);
     }
 }
 
 impl<P: Vst3Plugin> IPluginBaseTrait for Wrapper<P> {
     unsafe fn initialize(&self, _context: *mut FUnknown) -> tresult {
-        // We currently don't need or allow any initialization logic
+        self.inner.initialize_dirty();
         kResultOk
     }
 
     unsafe fn terminate(&self) -> tresult {
+        self.inner.terminate_dirty();
         kResultOk
     }
 }
@@ -815,8 +817,7 @@ impl<P: Vst3Plugin> IEditControllerTrait for Wrapper<P> {
     }
 
     unsafe fn setComponentHandler(&self, handler: *mut IComponentHandler) -> tresult {
-        *self.inner.component_handler.borrow_mut() =
-            unsafe { ComRef::from_raw(handler) }.map(|r| r.to_com_ptr());
+        unsafe { self.inner.replace_component_handler(handler) };
 
         kResultOk
     }

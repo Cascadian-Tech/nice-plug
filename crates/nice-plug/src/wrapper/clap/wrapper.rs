@@ -1,3 +1,5 @@
+#[cfg(feature = "editor")]
+use crate::wrapper::dirty::{EditorLease, InFlight};
 use atomic_refcell::{AtomicRefCell, AtomicRefMut};
 use clap_sys::events::{
     CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_IS_LIVE, CLAP_EVENT_MIDI, CLAP_EVENT_MIDI_SYSEX,
@@ -67,7 +69,7 @@ use crossbeam::atomic::AtomicCell;
 use crossbeam::queue::ArrayQueue;
 use nice_plug_core::audio_setup::{AudioIOLayout, AuxiliaryBuffers, BufferConfig, ProcessMode};
 #[cfg(feature = "editor")]
-use nice_plug_core::context::gui::GuiContext;
+use nice_plug_core::context::gui::{DirtyNotification, GuiContext};
 use nice_plug_core::context::process::{
     HostCall, HostSegment, HostSegmentRaw, HostSegmentValidity, Transport,
 };
@@ -138,6 +140,14 @@ pub struct Wrapper<P: ClapPlugin> {
     /// creating an editor. Wrapped in an `AtomicRefCell` because it needs to be initialized late.
     #[cfg(feature = "editor")]
     editor: AtomicRefCell<Option<Mutex<P::Editor>>>,
+    #[cfg(feature = "editor")]
+    dirty_lease: AtomicRefCell<Option<Arc<EditorLease>>>,
+    #[cfg(feature = "editor")]
+    dirty_alive: AtomicBool,
+    #[cfg(feature = "editor")]
+    dirty_in_flight: AtomicBool,
+    #[cfg(feature = "editor")]
+    host_state: AtomicRefCell<Option<ClapPtr<clap_sys::ext::state::clap_host_state>>>,
     /// A handle for the currently active editor instance. The plugin should implement `Drop` on
     /// this handle for its closing behavior.
     #[cfg(feature = "editor")]
@@ -679,6 +689,14 @@ impl<P: ClapPlugin> Wrapper<P> {
             #[cfg(feature = "editor")]
             editor: AtomicRefCell::new(None),
             #[cfg(feature = "editor")]
+            dirty_lease: AtomicRefCell::new(None),
+            #[cfg(feature = "editor")]
+            dirty_alive: AtomicBool::new(false),
+            #[cfg(feature = "editor")]
+            dirty_in_flight: AtomicBool::new(false),
+            #[cfg(feature = "editor")]
+            host_state: AtomicRefCell::new(None),
+            #[cfg(feature = "editor")]
             editor_window: AtomicRefCell::new(None),
             #[cfg(feature = "editor")]
             fallback_scale_factor: AtomicCell::new(None),
@@ -899,12 +917,56 @@ impl<P: ClapPlugin> Wrapper<P> {
     }
 
     #[cfg(feature = "editor")]
-    fn make_gui_context(self: Arc<Self>) -> GuiContext {
+    fn make_gui_context(self: Arc<Self>, dirty_lease: Arc<EditorLease>) -> GuiContext {
         GuiContext::new(Arc::new(WrapperGuiContext {
             wrapper: Arc::downgrade(&self),
+            dirty_lease,
             #[cfg(debug_assertions)]
             param_gesture_checker: Default::default(),
         }))
+    }
+
+    #[cfg(feature = "editor")]
+    fn close_dirty_editor(&self) {
+        let lease = self.dirty_lease.borrow_mut().take();
+        if let Some(lease) = lease {
+            lease.close();
+        }
+    }
+
+    #[cfg(feature = "editor")]
+    pub(super) fn notify_non_parameter_dirty(&self, lease: &EditorLease) -> DirtyNotification {
+        let live = || lease.is_live_owner() && self.dirty_alive.load(Ordering::Acquire);
+        if !live() {
+            return DirtyNotification::Failed;
+        }
+        let Some(_in_flight) = InFlight::enter(&self.dirty_in_flight) else {
+            return DirtyNotification::Failed;
+        };
+        // Copy function pointers before external callbacks; neither cell remains borrowed.
+        let thread_check = {
+            self.host_thread_check
+                .borrow()
+                .as_ref()
+                .map(|p| p.is_main_thread)
+        };
+        if let Some(check) = thread_check {
+            let Some(check) = check else {
+                return DirtyNotification::Failed;
+            };
+            if !unsafe { check(&*self.host_callback) } || !live() {
+                return DirtyNotification::Failed;
+            }
+        }
+        let notify = { self.host_state.borrow().as_ref().and_then(|p| p.mark_dirty) };
+        if !live() {
+            return DirtyNotification::Failed;
+        }
+        let Some(notify) = notify else {
+            return DirtyNotification::Unsupported;
+        };
+        unsafe { notify(&*self.host_callback) };
+        DirtyNotification::Notified
     }
 
     /// # Note
@@ -1930,6 +1992,11 @@ impl<P: ClapPlugin> Wrapper<P> {
         unsafe {
             #[cfg(feature = "editor")]
             {
+                let state = query_host_extension::<clap_sys::ext::state::clap_host_state>(
+                    &wrapper.host_callback,
+                    clap_sys::ext::state::CLAP_EXT_STATE,
+                );
+                *wrapper.host_state.borrow_mut() = state;
                 *wrapper.host_gui.borrow_mut() = query_host_extension::<
                     clap_sys::ext::gui::clap_host_gui,
                 >(
@@ -1957,6 +2024,8 @@ impl<P: ClapPlugin> Wrapper<P> {
 
         #[cfg(feature = "editor")]
         wrapper.update_track_info_from_host();
+        #[cfg(feature = "editor")]
+        wrapper.dirty_alive.store(true, Ordering::Release);
 
         true
     }
@@ -1964,6 +2033,11 @@ impl<P: ClapPlugin> Wrapper<P> {
     unsafe extern "C" fn destroy(plugin: *const clap_plugin) {
         assert!(!plugin.is_null() && unsafe { !(*plugin).plugin_data.is_null() });
         let this = unsafe { Arc::from_raw((*plugin).plugin_data as *mut Self) };
+        #[cfg(feature = "editor")]
+        {
+            this.dirty_alive.store(false, Ordering::Release);
+            this.close_dirty_editor();
+        }
         crate::nice_debug_assert_eq!(Arc::strong_count(&this), 1);
 
         drop(this);
@@ -3007,8 +3081,15 @@ impl<P: ClapPlugin> Wrapper<P> {
         // For this function we need the underlying Arc so we can pass it to the editor
         let wrapper = unsafe { Arc::from_raw((*plugin).plugin_data as *const Self) };
 
+        if !wrapper.dirty_alive.load(Ordering::Acquire) {
+            let _ = Arc::into_raw(wrapper);
+            return false;
+        }
         let result = {
             if wrapper.editor_window.borrow().is_none() {
+                wrapper.close_dirty_editor();
+                let lease = Arc::new(EditorLease::preparing());
+                *wrapper.dirty_lease.borrow_mut() = Some(lease.clone());
                 use std::error::Error;
 
                 use nice_plug_core::editor::{
@@ -3026,6 +3107,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                 struct ClapHostCallbacks<P: ClapPlugin> {
                     wrapper: Weak<Wrapper<P>>,
                     host_gui: ClapPtr<clap_host_gui>,
+                    lease: Arc<EditorLease>,
                 }
 
                 impl<P: ClapPlugin> HostCallbacks for ClapHostCallbacks<P> {
@@ -3056,6 +3138,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                     }
 
                     fn destroyed(&mut self) {
+                        self.lease.close();
                         if let Some(wrapper) = self.wrapper.upgrade() {
                             unsafe_clap_call! {
                                 &*self.host_gui=>closed(
@@ -3069,6 +3152,7 @@ impl<P: ClapPlugin> Wrapper<P> {
 
                 let callbacks: Box<dyn HostCallbacks> = Box::new(ClapHostCallbacks {
                     wrapper: wrapper.this.borrow().clone(),
+                    lease: lease.clone(),
                     host_gui: ClapPtr::clone(wrapper.host_gui.borrow().as_ref().unwrap()),
                 });
 
@@ -3091,22 +3175,34 @@ impl<P: ClapPlugin> Wrapper<P> {
 
                 let fallback_scale_factor = wrapper.fallback_scale_factor.load();
 
-                match wrapper.editor.borrow().as_ref().unwrap().lock().spawn(
-                    None,
-                    true,
-                    fallback_scale_factor,
-                    wrapper.clone().make_gui_context(),
-                    Some(HostMethods {
-                        callbacks,
-                        main_thread_caller,
-                    }),
-                ) {
+                let spawned = {
+                    let editor = wrapper.editor.borrow();
+                    editor.as_ref().unwrap().lock().spawn(
+                        None,
+                        true,
+                        fallback_scale_factor,
+                        wrapper.clone().make_gui_context(lease.clone()),
+                        Some(HostMethods {
+                            callbacks,
+                            main_thread_caller,
+                        }),
+                    )
+                };
+                match spawned {
                     Ok(editor_window) => {
                         *wrapper.editor_window.borrow_mut() =
                             Some(fragile::Fragile::new(editor_window));
-                        true
+                        if wrapper.dirty_alive.load(Ordering::Acquire) && lease.activate() {
+                            true
+                        } else {
+                            lease.close();
+                            let window = wrapper.editor_window.borrow_mut().take();
+                            drop(window);
+                            false
+                        }
                     }
                     Err(e) => {
+                        lease.close();
                         crate::nice_error!("Failed to open editor: {}", e);
                         false
                     }
@@ -3184,9 +3280,10 @@ impl<P: ClapPlugin> Wrapper<P> {
         check_null_ptr!((), plugin, unsafe { (*plugin).plugin_data });
         let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
 
-        let mut editor_handle = wrapper.editor_window.borrow_mut();
+        wrapper.close_dirty_editor();
+        let editor_handle = wrapper.editor_window.borrow_mut().take();
         if editor_handle.is_some() {
-            *editor_handle = None;
+            drop(editor_handle);
         } else {
             #[cfg(debug_assertions)]
             crate::nice_warn!("Tried destroying editor while the editor was not active");
@@ -3871,5 +3968,13 @@ unsafe fn query_host_extension<T>(
         unsafe { Some(ClapPtr::new(extension_ptr as *const T)) }
     } else {
         None
+    }
+}
+
+#[cfg(feature = "editor")]
+impl<P: ClapPlugin> Drop for Wrapper<P> {
+    fn drop(&mut self) {
+        self.dirty_alive.store(false, Ordering::Release);
+        self.close_dirty_editor();
     }
 }
