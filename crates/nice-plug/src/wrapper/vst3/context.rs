@@ -394,7 +394,6 @@ impl<P: Vst3Plugin + Send> GuiContextInner for WrapperGuiContext<P> {
         use vst3::{
             ComPtr, Interface,
             Steinberg::{
-                FUnknownTrait,
                 Vst::{IComponentHandler2, IComponentHandler2Trait},
                 kNoInterface,
             },
@@ -418,10 +417,13 @@ impl<P: Vst3Plugin + Send> GuiContextInner for WrapperGuiContext<P> {
             return D::Unsupported;
         };
         let mut pointer = std::ptr::null_mut();
+        let raw = handler.handler.as_ptr();
         let code = unsafe {
-            handler
-                .handler
-                .queryInterface(IComponentHandler2::IID.as_ptr().cast(), &mut pointer)
+            ((*(*raw).vtbl).base.queryInterface)(
+                raw.cast(),
+                IComponentHandler2::IID.as_ptr().cast(),
+                &mut pointer,
+            )
         };
         if code != kResultOk {
             return if code == kNoInterface {
