@@ -1046,55 +1046,58 @@ impl<P: ClapPlugin> Wrapper<P> {
         sample_rate: Option<f32>,
     ) -> bool {
         match self.param_by_hash.get(&hash) {
-            Some(param_ptr) => {
-                match update_type {
-                    ClapParamUpdate::PlainValueSet(clap_plain_value) => {
-                        if !clap_plain_value.is_finite() {
-                            return false;
-                        }
-
-                        let normalized_value = clap_plain_value as f32
-                            / unsafe { param_ptr.step_count() }.unwrap_or(1) as f32;
-
-                        apply_parameter_value(param_ptr, normalized_value, sample_rate, || {
-                            #[cfg(feature = "editor")]
-                            {
-                                let task_posted = self.schedule_gui(Task::ParameterValueChanged(hash, normalized_value));
-                                crate::nice_debug_assert!(task_posted, "The task queue is full, dropping task...");
-                            }
-                        });
-
-                        true
+            Some(param_ptr) => match update_type {
+                ClapParamUpdate::PlainValueSet(clap_plain_value) => {
+                    if !clap_plain_value.is_finite() {
+                        return false;
                     }
-                    ClapParamUpdate::PlainValueMod(clap_plain_delta) => {
-                        if !clap_plain_delta.is_finite() {
-                            return false;
+
+                    let normalized_value = clap_plain_value as f32
+                        / unsafe { param_ptr.step_count() }.unwrap_or(1) as f32;
+
+                    apply_parameter_value(param_ptr, normalized_value, sample_rate, || {
+                        #[cfg(feature = "editor")]
+                        {
+                            let task_posted = self
+                                .schedule_gui(Task::ParameterValueChanged(hash, normalized_value));
+                            crate::nice_debug_assert!(
+                                task_posted,
+                                "The task queue is full, dropping task..."
+                            );
                         }
+                    });
 
-                        let normalized_delta = clap_plain_delta as f32
-                            / unsafe { param_ptr.step_count() }.unwrap_or(1) as f32;
-
-                        if unsafe { param_ptr._internal_modulate_value(normalized_delta) } {
-                            if let Some(sample_rate) = sample_rate {
-                                unsafe { param_ptr._internal_update_smoother(sample_rate, false) };
-                            }
-
-                            #[cfg(feature = "editor")]
-                            {
-                                let task_posted = self.schedule_gui(
-                                    Task::ParameterModulationChanged(hash, normalized_delta),
-                                );
-                                crate::nice_debug_assert!(
-                                    task_posted,
-                                    "The task queue is full, dropping task..."
-                                );
-                            }
-                        }
-
-                        true
-                    }
+                    true
                 }
-            }
+                ClapParamUpdate::PlainValueMod(clap_plain_delta) => {
+                    if !clap_plain_delta.is_finite() {
+                        return false;
+                    }
+
+                    let normalized_delta = clap_plain_delta as f32
+                        / unsafe { param_ptr.step_count() }.unwrap_or(1) as f32;
+
+                    if unsafe { param_ptr._internal_modulate_value(normalized_delta) } {
+                        if let Some(sample_rate) = sample_rate {
+                            unsafe { param_ptr._internal_update_smoother(sample_rate, false) };
+                        }
+
+                        #[cfg(feature = "editor")]
+                        {
+                            let task_posted = self.schedule_gui(Task::ParameterModulationChanged(
+                                hash,
+                                normalized_delta,
+                            ));
+                            crate::nice_debug_assert!(
+                                task_posted,
+                                "The task queue is full, dropping task..."
+                            );
+                        }
+                    }
+
+                    true
+                }
+            },
             _ => false,
         }
     }
@@ -3969,9 +3972,22 @@ impl<P: ClapPlugin> Drop for Wrapper<P> {
 
 // The real value-delivery block, shared with its headless test. Callers retain
 // ownership of the parameter while this private function uses its pointer.
-fn apply_parameter_value(param: &ParamPtr, normalized: f32, sample_rate: Option<f32>, notify: impl FnOnce()) {
-    if unsafe { param._internal_set_normalized_value(normalized) } {
-        if let Some(rate) = sample_rate { unsafe { param._internal_update_smoother(rate, false) }; }
+fn apply_parameter_value(
+    param: &ParamPtr,
+    normalized: f32,
+    sample_rate: Option<f32>,
+    notify: impl FnOnce(),
+) {
+    // Independent relaxed reads, not a claim of a coherent multi-atomic snapshot.
+    let base_plain = unsafe { param.unmodulated_plain_value() };
+    let base_normalized = unsafe { param.unmodulated_normalized_value() };
+    let output_changed = unsafe { param._internal_set_normalized_value(normalized) };
+    let base_changed = base_plain != unsafe { param.unmodulated_plain_value() }
+        || base_normalized != unsafe { param.unmodulated_normalized_value() };
+    if output_changed && let Some(rate) = sample_rate {
+        unsafe { param._internal_update_smoother(rate, false) };
+    }
+    if output_changed || base_changed {
         notify();
     }
 }
@@ -3979,34 +3995,66 @@ fn apply_parameter_value(param: &ParamPtr, normalized: f32, sample_rate: Option<
 #[cfg(test)]
 mod p3_delivery_tests {
     use super::apply_parameter_value;
-    use nice_plug_core::params::{FloatParam, InternalParamMut, Param, range::{FloatRange, DecibelZeroRange}, smoothing::SmoothingStyle};
+    use nice_plug_core::params::{
+        FloatParam, InternalParamMut, Param,
+        range::{DecibelZeroRange, FloatRange},
+        smoothing::SmoothingStyle,
+    };
     use std::cell::Cell;
 
     #[test]
     fn base_edit_notifies_without_smoother_restart() {
-        for range in [FloatRange::Linear { min: 0.0, max: 1.0 }, FloatRange::DecibelsWithZero(DecibelZeroRange::new(-60.0, 6.0).unwrap())] {
+        for range in [
+            FloatRange::Linear { min: 0.0, max: 1.0 },
+            FloatRange::DecibelsWithZero(DecibelZeroRange::new(-60.0, 6.0).unwrap()),
+        ] {
             for offset in [-1.0, 1.0] {
-                let p = FloatParam::new("level", range.unnormalize(0.5), range).with_smoother(SmoothingStyle::Linear(10.0));
-                unsafe { p._internal_update_smoother(48000.0, true); }
+                let p = FloatParam::new("level", range.unnormalize(0.5), range)
+                    .with_smoother(SmoothingStyle::Linear(10.0));
+                unsafe {
+                    p._internal_update_smoother(48000.0, true);
+                }
                 assert!(unsafe { p._internal_modulate_value(offset) });
-                unsafe { p._internal_update_smoother(48000.0, false); }
-                for _ in 0..73 { p.smoothed.next(); }
+                unsafe {
+                    p._internal_update_smoother(48000.0, false);
+                }
+                for _ in 0..73 {
+                    p.smoothed.next();
+                }
                 let remaining = p.smoothed.steps_left();
                 let before = p.smoothed.previous_value();
                 let notifications = Cell::new(0);
-                apply_parameter_value(&p.as_ptr(), 0.25, Some(48000.0), || notifications.set(notifications.get() + 1));
-                assert_eq!(notifications.get(), 1, "base-only edit must notify the editor");
+                apply_parameter_value(&p.as_ptr(), 0.25, Some(48000.0), || {
+                    notifications.set(notifications.get() + 1)
+                });
+                assert_eq!(
+                    notifications.get(),
+                    1,
+                    "base-only edit must notify the editor"
+                );
                 assert_eq!(p.unmodulated_plain_value(), range.unnormalize(0.25));
-                assert_eq!(p.smoothed.steps_left(), remaining, "base-only edit must not restart ramp");
+                assert_eq!(
+                    p.smoothed.steps_left(),
+                    remaining,
+                    "base-only edit must not restart ramp"
+                );
                 assert_eq!(p.smoothed.previous_value(), before);
-                apply_parameter_value(&p.as_ptr(), 0.25, Some(48000.0), || notifications.set(notifications.get() + 1));
+                apply_parameter_value(&p.as_ptr(), 0.25, Some(48000.0), || {
+                    notifications.set(notifications.get() + 1)
+                });
                 assert_eq!(notifications.get(), 1, "duplicate must not notify");
                 assert_eq!(p.smoothed.steps_left(), remaining);
-                for _ in 0..remaining { p.smoothed.next(); }
+                for _ in 0..remaining {
+                    p.smoothed.next();
+                }
                 assert!(!p.smoothed.is_smoothing());
                 assert_eq!(p.smoothed.previous_value(), p.value());
-                unsafe { p._internal_modulate_value(0.0); }
-                apply_parameter_value(&p.as_ptr(), 0.7, Some(48000.0), || notifications.set(notifications.get() + 1));
+                unsafe {
+                    p._internal_modulate_value(0.0);
+                }
+                apply_parameter_value(&p.as_ptr(), 0.7, Some(48000.0), || {
+                    notifications.set(notifications.get() + 1)
+                });
                 assert_eq!(notifications.get(), 2);
                 assert_eq!(p.smoothed.steps_left(), 480);
             }
