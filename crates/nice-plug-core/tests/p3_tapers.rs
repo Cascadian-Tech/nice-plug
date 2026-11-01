@@ -107,6 +107,8 @@ fn check_oracle(kind: &str) {
     let mut rows = 0;
     let mut domain_count = 0;
     let mut previous = None;
+    let mut max_ulp = 0u32;
+    let mut max_inverse = 0.0f32;
     for line in include_str!("p3_tapers_oracle.csv")
         .lines()
         .filter(|l| !l.starts_with('#'))
@@ -124,8 +126,19 @@ fn check_oracle(kind: &str) {
         } else {
             db_range()
         };
-        close(range.unnormalize(v[2]), v[3]);
-        assert!((range.normalize(v[3]) - v[4]).abs() <= 2e-6, "{line}");
+        let actual = range.unnormalize(v[2]);
+        close(actual, v[3]);
+        max_ulp = max_ulp.max(actual.to_bits().abs_diff(v[3].to_bits()));
+        let inverse_error = (range.normalize(v[3]) - v[4]).abs();
+        max_inverse = max_inverse.max(inverse_error);
+        assert!(inverse_error <= 2e-6, "{line}");
+        let rev = reversed(range);
+        assert!((rev.normalize(v[3]) - (1.0 - v[4])).abs() <= 2e-6, "{line}");
+        // Only inputs representable after both f32 complements retain n exactly.
+        // Smaller values round to an endpoint in the existing Reversed composition.
+        if (1.0 - (1.0 - v[2])).to_bits() == v[2].to_bits() {
+            close(rev.unnormalize(1.0 - v[2]), v[3]);
+        }
         let domain = (v[0].to_bits(), v[1].to_bits());
         if previous != Some(domain) {
             domain_count += 1;
@@ -135,7 +148,9 @@ fn check_oracle(kind: &str) {
     }
     assert_eq!(domain_count, if kind == "log" { 8 } else { 1 });
     assert!(rows >= domain_count * 257);
-    eprintln!("{kind}: {rows} independent Decimal vectors across {domain_count} domains");
+    eprintln!(
+        "{kind}: {rows} independent Decimal vectors across {domain_count} domains; maximum plain ULP={max_ulp}, inverse error={max_inverse}"
+    );
 }
 #[test]
 fn positive_log_range_matches_oracle() {
@@ -278,6 +293,7 @@ fn plain_edit_survives_saturated_modulation() {
 fn taper_conversion_no_alloc() {
     let ranges = [log_range(20.0, 400.0), db_range()];
     let p = FloatParam::new("allocated before guard", 0.5, db_range());
+    let started = std::time::Instant::now();
     ALLOCATIONS.with(|c| c.set(Some(0)));
     for i in 0..10000 {
         let n = std::hint::black_box((i % 1001) as f32 / 1000.0);
@@ -295,4 +311,8 @@ fn taper_conversion_no_alloc() {
     }
     let count = ALLOCATIONS.with(|c| c.replace(None)).unwrap();
     assert_eq!(count, 0);
+    eprintln!(
+        "10000 mixed conversion/step/modulation iterations: {:?}; allocation count {count}. Microbenchmark only, not full callback qualification.",
+        started.elapsed()
+    );
 }

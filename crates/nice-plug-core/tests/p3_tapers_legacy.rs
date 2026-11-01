@@ -1,3 +1,7 @@
+// Exact reference captured from the pre-change framework on macOS ARM64.
+// Other targets still run the framework's existing portable range tests.
+#![cfg(all(target_os = "macos", target_arch = "aarch64"))]
+
 use nice_plug_core::params::{FloatParam, range::FloatRange};
 
 #[test]
