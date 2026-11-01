@@ -1,5 +1,39 @@
 //! Continuous (or discrete, with a step size) floating point parameters.
 
+#[cfg(test)]
+mod p3_cache_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn plain_edit_survives_saturated_modulation() {
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let observed = callbacks.clone();
+        let param = FloatParam::new("level", 0.5, FloatRange::Linear { min: 0.0, max: 1.0 })
+            .with_callback(Arc::new(move |_| {
+                observed.fetch_add(1, Ordering::Relaxed);
+            }));
+        // Use only the original API, before any implementation of the new ranges.
+        assert!(unsafe { param._internal_modulate_value(1.0) });
+        assert_eq!(param.modulated_plain_value(), 1.0);
+        let changed = unsafe { param._internal_set_plain_value(0.25) };
+        let stored_base = param.unmodulated_plain_value();
+        let stored_normalized = param.unmodulated_normalized_value();
+        let callbacks_before_release = callbacks.load(Ordering::Relaxed);
+        assert!(unsafe { param._internal_modulate_value(0.0) });
+        eprintln!(
+            "P3 baseline: output_changed={changed}, base={stored_base}, normalized_base={stored_normalized}, callbacks_before_release={callbacks_before_release}, released_output={}",
+            param.modulated_plain_value()
+        );
+        assert!(!changed, "base-only changes must preserve the output-change boolean");
+        assert_eq!(callbacks_before_release, 1, "base-only edits do not call the output callback");
+        assert_eq!(stored_base, 0.25, "the latest base edit must survive saturation");
+        assert_eq!(stored_normalized, 0.25);
+        assert_eq!(param.modulated_plain_value(), 0.25);
+        assert_eq!(callbacks.load(Ordering::Relaxed), 2);
+    }
+}
+
 use atomic_float::AtomicF32;
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
