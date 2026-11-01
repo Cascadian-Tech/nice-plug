@@ -244,13 +244,16 @@ impl InternalParamMut for FloatParam {
         // multiple times. This can be problematic when they're used to trigger expensive
         // computations when a parameter changes.
         let old_value = self.value.swap(value, Ordering::Relaxed);
+        // A base edit can leave the modulated output saturated at the same value.
+        // Retain that edit for state and subsequent modulation without firing the
+        // output callback or requesting a smoother restart.
+        self.normalized_value
+            .store(normalized_value, Ordering::Relaxed);
+        self.unmodulated_value
+            .store(unmodulated_value, Ordering::Relaxed);
+        self.unmodulated_normalized_value
+            .store(unmodulated_normalized_value, Ordering::Relaxed);
         if value != old_value {
-            self.normalized_value
-                .store(normalized_value, Ordering::Relaxed);
-            self.unmodulated_value
-                .store(unmodulated_value, Ordering::Relaxed);
-            self.unmodulated_normalized_value
-                .store(unmodulated_normalized_value, Ordering::Relaxed);
             if let Some(f) = &self.value_changed {
                 f(value);
             }
