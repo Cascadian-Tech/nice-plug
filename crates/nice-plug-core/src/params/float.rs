@@ -210,13 +210,16 @@ impl InternalParamMut for FloatParam {
         // multiple times. This can be problematic when they're used to trigger expensive
         // computations when a parameter changes.
         let old_value = self.value.swap(value, Ordering::Relaxed);
+        // A base edit can leave the modulated output saturated at the same value.
+        // Retain that edit for state and subsequent modulation without firing the
+        // output callback or requesting a smoother restart.
+        self.normalized_value
+            .store(normalized_value, Ordering::Relaxed);
+        self.unmodulated_value
+            .store(unmodulated_value, Ordering::Relaxed);
+        self.unmodulated_normalized_value
+            .store(unmodulated_normalized_value, Ordering::Relaxed);
         if value != old_value {
-            self.normalized_value
-                .store(normalized_value, Ordering::Relaxed);
-            self.unmodulated_value
-                .store(unmodulated_value, Ordering::Relaxed);
-            self.unmodulated_normalized_value
-                .store(unmodulated_normalized_value, Ordering::Relaxed);
             if let Some(f) = &self.value_changed {
                 f(value);
             }
@@ -311,7 +314,15 @@ impl FloatParam {
     pub fn with_smoother(mut self, style: SmoothingStyle) -> Self {
         // Logarithmic smoothing will cause problems if the range goes through zero since then you
         // end up multiplying by zero
+        fn is_silent_db_range(range: &FloatRange) -> bool {
+            match range {
+                FloatRange::DecibelsWithZero(_) => true,
+                FloatRange::Reversed(inner) => is_silent_db_range(inner),
+                _ => false,
+            }
+        }
         let goes_through_zero = match (&style, &self.range) {
+            (SmoothingStyle::Logarithmic(_), range) if is_silent_db_range(range) => true,
             (
                 SmoothingStyle::Logarithmic(_),
                 FloatRange::Linear { min, max }
@@ -419,4 +430,77 @@ fn decimals_from_step_size(step_size: f32) -> usize {
     }
 
     num_digits as usize
+}
+
+#[cfg(test)]
+mod p3_cache_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn reverse(range: FloatRange) -> FloatRange {
+        FloatRange::Reversed(Box::leak(Box::new(range)))
+    }
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "Logarithmic smoothing does not work")]
+    fn silent_range_rejects_logarithmic_smoother() {
+        let _ = FloatParam::new(
+            "level",
+            1.0,
+            FloatRange::DecibelsWithZero(
+                super::super::range::DecibelZeroRange::new(-60.0, 6.0).unwrap(),
+            ),
+        )
+        .with_smoother(SmoothingStyle::Logarithmic(20.0));
+    }
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "Logarithmic smoothing does not work")]
+    fn reversed_silent_range_rejects_logarithmic_smoother() {
+        let _ = FloatParam::new(
+            "level",
+            1.0,
+            reverse(reverse(FloatRange::DecibelsWithZero(
+                super::super::range::DecibelZeroRange::new(-60.0, 6.0).unwrap(),
+            ))),
+        )
+        .with_smoother(SmoothingStyle::Logarithmic(20.0));
+    }
+
+    #[test]
+    fn plain_edit_survives_saturated_modulation() {
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let observed = callbacks.clone();
+        let param = FloatParam::new("level", 0.5, FloatRange::Linear { min: 0.0, max: 1.0 })
+            .with_callback(Arc::new(move |_| {
+                observed.fetch_add(1, Ordering::Relaxed);
+            }));
+        // Use only the original API, before any implementation of the new ranges.
+        assert!(unsafe { param._internal_modulate_value(1.0) });
+        assert_eq!(param.modulated_plain_value(), 1.0);
+        let changed = unsafe { param._internal_set_plain_value(0.25) };
+        let stored_base = param.unmodulated_plain_value();
+        let stored_normalized = param.unmodulated_normalized_value();
+        let callbacks_before_release = callbacks.load(Ordering::Relaxed);
+        assert!(unsafe { param._internal_modulate_value(0.0) });
+        eprintln!(
+            "P3 baseline: output_changed={changed}, base={stored_base}, normalized_base={stored_normalized}, callbacks_before_release={callbacks_before_release}, released_output={}",
+            param.modulated_plain_value()
+        );
+        assert!(
+            !changed,
+            "base-only changes must preserve the output-change boolean"
+        );
+        assert_eq!(
+            callbacks_before_release, 1,
+            "base-only edits do not call the output callback"
+        );
+        assert_eq!(
+            stored_base, 0.25,
+            "the latest base edit must survive saturation"
+        );
+        assert_eq!(stored_normalized, 0.25);
+        assert_eq!(param.modulated_plain_value(), 0.25);
+        assert_eq!(callbacks.load(Ordering::Relaxed), 2);
+    }
 }
