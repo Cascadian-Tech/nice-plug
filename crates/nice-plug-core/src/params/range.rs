@@ -2,9 +2,59 @@
 
 use crate::{nice_debug_assert, util};
 
+/// Validated positive logarithmic bounds. Fields cannot be constructed directly.
+///
+/// ```compile_fail
+/// use nice_plug_core::params::range::PositiveLogRange;
+/// let _ = PositiveLogRange { min: 1.0, max: 2.0, log_min: 0.0, log_span: 1.0 };
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct PositiveLogRange {
+    min: f32,
+    max: f32,
+    log_min: f64,
+    log_span: f64,
+}
+impl PositiveLogRange {
+    /// Construct off the audio thread. Both bounds must be finite, positive and ordered.
+    pub fn new(min: f32, max: f32) -> Option<Self> {
+        if !min.is_finite() || !max.is_finite() || min <= 0.0 || min >= max { return None; }
+        Some(Self { min, max, log_min: (min as f64).ln(), log_span: ((max as f64) / (min as f64)).ln() })
+    }
+}
+
+/// A decibel-linear amplitude range with exact silence at normalized zero.
+/// Its positive floor is discontinuous: values below the floor normalize to zero.
+/// Keep saved plain amplitudes as plain values rather than roundtripping this map.
+///
+/// ```compile_fail
+/// use nice_plug_core::params::range::DecibelZeroRange;
+/// let _ = DecibelZeroRange { min_db: -60.0, span_db: 66.0, max: 2.0 };
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct DecibelZeroRange {
+    min_db: f64,
+    span_db: f64,
+    max: f32,
+}
+impl DecibelZeroRange {
+    /// Construct off audio, rejecting endpoints that underflow, overflow or coincide as f32.
+    pub fn new(min_db: f32, max_db: f32) -> Option<Self> {
+        if !min_db.is_finite() || !max_db.is_finite() || min_db >= max_db { return None; }
+        let min = 10.0f64.powf(min_db as f64 / 20.0) as f32;
+        let max = 10.0f64.powf(max_db as f64 / 20.0) as f32;
+        if !min.is_finite() || !max.is_finite() || min <= 0.0 || min >= max { return None; }
+        Some(Self { min_db: min_db as f64, span_db: max_db as f64 - min_db as f64, max })
+    }
+}
+
 /// A distribution for a floating point parameter's range. All range endpoints are inclusive.
 #[derive(Debug, Clone, Copy)]
 pub enum FloatRange {
+    /// Exact positive logarithmic mapping with validated bounds.
+    Logarithmic(PositiveLogRange),
+    /// Decibel-linear positive gain, with exact silence at normalized zero.
+    DecibelsWithZero(DecibelZeroRange),
     /// The values are uniformly distributed between `min` and `max`.
     Linear { min: f32, max: f32 },
     /// The range is skewed by a factor. Values above 1.0 will make the end of the range wider,
@@ -38,6 +88,16 @@ pub enum IntRange {
 }
 
 impl FloatRange {
+    fn new_range_step(&self, from: f32, step: Option<f32>, finer: bool, direction: f32, min: f32, max: f32) -> f32 {
+        let delta = if finer { 0.005 } else { 0.02 };
+        let naive = self.unnormalize(self.normalize(from) + direction * delta);
+        match step {
+            Some(step) if (naive - from).abs() > step => self.snap_to_step(naive, step),
+            Some(step) => from + direction * step,
+            None => naive,
+        }.clamp(min, max)
+    }
+
     /// Calculate a skew factor for [`FloatRange::Skewed`] and [`FloatRange::SymmetricalSkewed`].
     /// Positive values make the end of the range wider while negative make the start of the range
     /// wider.
@@ -103,6 +163,9 @@ impl FloatRange {
                     (1.0 - inverted_scaled_proportion.powf(*factor)) * 0.5
                 }
             }
+            // DELIBERATELY INCOMPLETE TEST CONTROL: linear maps, without NaN guards.
+            FloatRange::Logarithmic(r) => (plain.clamp(r.min, r.max) - r.min) / (r.max - r.min),
+            FloatRange::DecibelsWithZero(r) => plain.clamp(0.0, r.max) / r.max,
             FloatRange::Reversed(range) => 1.0 - range.normalize(plain),
         }
     }
@@ -135,6 +198,9 @@ impl FloatRange {
 
                 (skewed_proportion * (max - min)) + min
             }
+            // DELIBERATELY INCOMPLETE TEST CONTROL: replace only after real numeric reds.
+            FloatRange::Logarithmic(r) => r.min + normalized * (r.max - r.min),
+            FloatRange::DecibelsWithZero(r) => normalized * r.max,
             FloatRange::Reversed(range) => range.unnormalize(1.0 - normalized),
         }
     }
@@ -164,6 +230,8 @@ impl FloatRange {
                 }
                 .clamp(*min, *max)
             }
+            FloatRange::Logarithmic(r) => self.new_range_step(from, step_size, finer, -1.0, r.min, r.max),
+            FloatRange::DecibelsWithZero(r) => self.new_range_step(from, step_size, finer, -1.0, 0.0, r.max),
             FloatRange::Reversed(range) => range.next_step(from, step_size, finer),
         }
     }
@@ -189,6 +257,8 @@ impl FloatRange {
                 }
                 .clamp(*min, *max)
             }
+            FloatRange::Logarithmic(r) => self.new_range_step(from, step_size, finer, 1.0, r.min, r.max),
+            FloatRange::DecibelsWithZero(r) => self.new_range_step(from, step_size, finer, 1.0, 0.0, r.max),
             FloatRange::Reversed(range) => range.previous_step(from, step_size, finer),
         }
     }
@@ -201,6 +271,8 @@ impl FloatRange {
             | FloatRange::SymmetricalSkewed { min, max, .. } => {
                 ((value / step_size).round() * step_size).clamp(*min, *max)
             }
+            FloatRange::Logarithmic(r) => ((value / step_size).round() * step_size).clamp(r.min, r.max),
+            FloatRange::DecibelsWithZero(r) => ((value / step_size).round() * step_size).clamp(0.0, r.max),
             FloatRange::Reversed(range) => range.snap_to_step(value, step_size),
         }
     }
@@ -220,6 +292,8 @@ impl FloatRange {
                     max
                 );
             }
+            // Private payload constructors already established these invariants in every build.
+            FloatRange::Logarithmic(_) | FloatRange::DecibelsWithZero(_) => {},
             FloatRange::Reversed(range) => range.assert_validity(),
         }
     }
