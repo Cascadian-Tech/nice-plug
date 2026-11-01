@@ -1056,25 +1056,13 @@ impl<P: ClapPlugin> Wrapper<P> {
                         let normalized_value = clap_plain_value as f32
                             / unsafe { param_ptr.step_count() }.unwrap_or(1) as f32;
 
-                        if unsafe { param_ptr._internal_set_normalized_value(normalized_value) } {
-                            if let Some(sample_rate) = sample_rate {
-                                unsafe { param_ptr._internal_update_smoother(sample_rate, false) };
-                            }
-
+                        apply_parameter_value(param_ptr, normalized_value, sample_rate, || {
                             #[cfg(feature = "editor")]
                             {
-                                // The GUI needs to be informed about the changed parameter value. This
-                                // triggers an `Editor::param_value_changed()` call on the GUI thread.
-                                let task_posted = self.schedule_gui(Task::ParameterValueChanged(
-                                    hash,
-                                    normalized_value,
-                                ));
-                                crate::nice_debug_assert!(
-                                    task_posted,
-                                    "The task queue is full, dropping task..."
-                                );
+                                let task_posted = self.schedule_gui(Task::ParameterValueChanged(hash, normalized_value));
+                                crate::nice_debug_assert!(task_posted, "The task queue is full, dropping task...");
                             }
-                        }
+                        });
 
                         true
                     }
@@ -3976,5 +3964,52 @@ impl<P: ClapPlugin> Drop for Wrapper<P> {
     fn drop(&mut self) {
         self.dirty_alive.store(false, Ordering::Release);
         self.close_dirty_editor();
+    }
+}
+
+// The real value-delivery block, shared with its headless test. Callers retain
+// ownership of the parameter while this private function uses its pointer.
+fn apply_parameter_value(param: &ParamPtr, normalized: f32, sample_rate: Option<f32>, notify: impl FnOnce()) {
+    if unsafe { param._internal_set_normalized_value(normalized) } {
+        if let Some(rate) = sample_rate { unsafe { param._internal_update_smoother(rate, false) }; }
+        notify();
+    }
+}
+
+#[cfg(test)]
+mod p3_delivery_tests {
+    use super::apply_parameter_value;
+    use nice_plug_core::params::{FloatParam, InternalParamMut, Param, range::{FloatRange, DecibelZeroRange}, smoothing::SmoothingStyle};
+    use std::cell::Cell;
+
+    #[test]
+    fn base_edit_notifies_without_smoother_restart() {
+        for range in [FloatRange::Linear { min: 0.0, max: 1.0 }, FloatRange::DecibelsWithZero(DecibelZeroRange::new(-60.0, 6.0).unwrap())] {
+            for offset in [-1.0, 1.0] {
+                let p = FloatParam::new("level", range.unnormalize(0.5), range).with_smoother(SmoothingStyle::Linear(10.0));
+                unsafe { p._internal_update_smoother(48000.0, true); }
+                assert!(unsafe { p._internal_modulate_value(offset) });
+                unsafe { p._internal_update_smoother(48000.0, false); }
+                for _ in 0..73 { p.smoothed.next(); }
+                let remaining = p.smoothed.steps_left();
+                let before = p.smoothed.previous_value();
+                let notifications = Cell::new(0);
+                apply_parameter_value(&p.as_ptr(), 0.25, Some(48000.0), || notifications.set(notifications.get() + 1));
+                assert_eq!(notifications.get(), 1, "base-only edit must notify the editor");
+                assert_eq!(p.unmodulated_plain_value(), range.unnormalize(0.25));
+                assert_eq!(p.smoothed.steps_left(), remaining, "base-only edit must not restart ramp");
+                assert_eq!(p.smoothed.previous_value(), before);
+                apply_parameter_value(&p.as_ptr(), 0.25, Some(48000.0), || notifications.set(notifications.get() + 1));
+                assert_eq!(notifications.get(), 1, "duplicate must not notify");
+                assert_eq!(p.smoothed.steps_left(), remaining);
+                for _ in 0..remaining { p.smoothed.next(); }
+                assert!(!p.smoothed.is_smoothing());
+                assert_eq!(p.smoothed.previous_value(), p.value());
+                unsafe { p._internal_modulate_value(0.0); }
+                apply_parameter_value(&p.as_ptr(), 0.7, Some(48000.0), || notifications.set(notifications.get() + 1));
+                assert_eq!(notifications.get(), 2);
+                assert_eq!(p.smoothed.steps_left(), 480);
+            }
+        }
     }
 }

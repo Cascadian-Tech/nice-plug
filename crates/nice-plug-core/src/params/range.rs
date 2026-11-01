@@ -163,9 +163,16 @@ impl FloatRange {
                     (1.0 - inverted_scaled_proportion.powf(*factor)) * 0.5
                 }
             }
-            // DELIBERATELY INCOMPLETE TEST CONTROL: linear maps, without NaN guards.
-            FloatRange::Logarithmic(r) => (plain.clamp(r.min, r.max) - r.min) / (r.max - r.min),
-            FloatRange::DecibelsWithZero(r) => plain.clamp(0.0, r.max) / r.max,
+            FloatRange::Logarithmic(r) => {
+                if plain.is_nan() || plain <= r.min { 0.0 }
+                else if plain >= r.max { 1.0 }
+                else { (((plain as f64 / r.min as f64).ln() / r.log_span).clamp(0.0, 1.0)) as f32 }
+            }
+            FloatRange::DecibelsWithZero(r) => {
+                if plain.is_nan() || plain <= 0.0 { 0.0 }
+                else if plain >= r.max { 1.0 }
+                else { (((20.0 * (plain as f64).log10() - r.min_db) / r.span_db).clamp(0.0, 1.0)) as f32 }
+            },
             FloatRange::Reversed(range) => 1.0 - range.normalize(plain),
         }
     }
@@ -198,9 +205,16 @@ impl FloatRange {
 
                 (skewed_proportion * (max - min)) + min
             }
-            // DELIBERATELY INCOMPLETE TEST CONTROL: replace only after real numeric reds.
-            FloatRange::Logarithmic(r) => r.min + normalized * (r.max - r.min),
-            FloatRange::DecibelsWithZero(r) => normalized * r.max,
+            FloatRange::Logarithmic(r) => {
+                if normalized.is_nan() || normalized <= 0.0 { r.min }
+                else if normalized >= 1.0 { r.max }
+                else { (r.log_min + normalized as f64 * r.log_span).exp() as f32 }
+            }
+            FloatRange::DecibelsWithZero(r) => {
+                if normalized.is_nan() || normalized <= 0.0 { 0.0 }
+                else if normalized >= 1.0 { r.max }
+                else { 10.0f64.powf((r.min_db + normalized as f64 * r.span_db) / 20.0) as f32 }
+            },
             FloatRange::Reversed(range) => range.unnormalize(1.0 - normalized),
         }
     }

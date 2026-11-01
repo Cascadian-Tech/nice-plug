@@ -1,7 +1,6 @@
 use nice_plug_core::params::{
     FloatParam, InternalParamMut, Param,
     range::{DecibelZeroRange, FloatRange, PositiveLogRange},
-    smoothing::SmoothingStyle,
 };
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -200,16 +199,4 @@ fn taper_conversion_no_alloc() {
     }
     let count = ALLOCATIONS.with(|c| c.replace(None)).unwrap();
     assert_eq!(count, 0);
-}
-#[test]
-#[cfg(debug_assertions)]
-#[should_panic(expected = "Logarithmic smoothing does not work")]
-fn silent_range_rejects_logarithmic_smoother() {
-    let _ = FloatParam::new("level", 1.0, db_range()).with_smoother(SmoothingStyle::Logarithmic(20.0));
-}
-#[test]
-#[cfg(debug_assertions)]
-#[should_panic(expected = "Logarithmic smoothing does not work")]
-fn reversed_silent_range_rejects_logarithmic_smoother() {
-    let _ = FloatParam::new("level", 1.0, reversed(reversed(db_range()))).with_smoother(SmoothingStyle::Logarithmic(20.0));
 }

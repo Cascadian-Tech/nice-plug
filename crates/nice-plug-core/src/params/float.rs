@@ -5,6 +5,20 @@ mod p3_cache_tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    fn reverse(range: FloatRange) -> FloatRange { FloatRange::Reversed(Box::leak(Box::new(range))) }
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "Logarithmic smoothing does not work")]
+fn silent_range_rejects_logarithmic_smoother() {
+    let _ = FloatParam::new("level", 1.0, FloatRange::DecibelsWithZero(super::super::range::DecibelZeroRange::new(-60.0, 6.0).unwrap())).with_smoother(SmoothingStyle::Logarithmic(20.0));
+}
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "Logarithmic smoothing does not work")]
+fn reversed_silent_range_rejects_logarithmic_smoother() {
+    let _ = FloatParam::new("level", 1.0, reverse(reverse(FloatRange::DecibelsWithZero(super::super::range::DecibelZeroRange::new(-60.0, 6.0).unwrap())))).with_smoother(SmoothingStyle::Logarithmic(20.0));
+}
+
     #[test]
     fn plain_edit_survives_saturated_modulation() {
         let callbacks = Arc::new(AtomicUsize::new(0));
@@ -348,7 +362,15 @@ impl FloatParam {
     pub fn with_smoother(mut self, style: SmoothingStyle) -> Self {
         // Logarithmic smoothing will cause problems if the range goes through zero since then you
         // end up multiplying by zero
+        fn is_silent_db_range(range: &FloatRange) -> bool {
+            match range {
+                FloatRange::DecibelsWithZero(_) => true,
+                FloatRange::Reversed(inner) => is_silent_db_range(inner),
+                _ => false,
+            }
+        }
         let goes_through_zero = match (&style, &self.range) {
+            (SmoothingStyle::Logarithmic(_), range) if is_silent_db_range(range) => true,
             (
                 SmoothingStyle::Logarithmic(_),
                 FloatRange::Linear { min, max }
