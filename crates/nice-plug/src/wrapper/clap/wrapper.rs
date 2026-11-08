@@ -2109,19 +2109,19 @@ impl<P: ClapPlugin> Wrapper<P> {
                     })
                 };
 
-                // If the host does not provide outputs or if it does not provide the required
+                // If the host does not provide the MAIN output or does not provide its required
                 // number of channels (should not happen, but Ableton Live does this for bypassed
                 // VST3 plugins) then we'll skip audio processing. In that case
-                // `buffer_manager.create_buffers` will have set one or more of the output buffers
-                // to empty slices since there is no storage to point them to. The auxiliary input
-                // buffers always point to valid storage.
+                // `buffer_manager.create_buffers` will have set one or more of the main output's
+                // channel buffers to empty slices since there is no storage to point them to. The
+                // auxiliary input buffers always point to valid storage. An AUXILIARY OUTPUT the
+                // host did not provide (a port it left unconnected, or fewer ports than declared)
+                // does not skip processing: its buffer reaches the plugin with EMPTY channel
+                // slices, so a plugin can route around an output the host is not listening to --
+                // skipping here silenced the whole plugin, inputs and events included, for as long
+                // as any one of its auxiliary outputs was unconnected.
                 let mut buffer_is_valid = true;
-                for output_buffer_slice in buffers.main_buffer.as_slice_immutable().iter().chain(
-                    buffers
-                        .aux_outputs
-                        .iter()
-                        .flat_map(|buffer| buffer.as_slice_immutable().iter()),
-                ) {
+                for output_buffer_slice in buffers.main_buffer.as_slice_immutable().iter() {
                     if output_buffer_slice.is_empty() {
                         buffer_is_valid = false;
                         break;
