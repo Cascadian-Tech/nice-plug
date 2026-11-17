@@ -890,6 +890,37 @@ impl<P: ClapPlugin> Wrapper<P> {
         result
     }
 
+    /// Queue a change of one of the plugin's own parameters made from within `process()`
+    /// ([`ProcessContext::queue_parameter_value()`]): one [`OutputParamEvent::SetValue`], pushed
+    /// onto the same queue the GUI's changes take and drained by [`Self::handle_out_events()`]
+    /// when this piece of the host's call has been processed. Unlike
+    /// [`Self::queue_parameter_event()`] this requests NO flush: the caller is inside `process()`
+    /// on the audio thread, where `clap_host_params::request_flush()` must not be called
+    /// (`[thread-safe,!audio-thread]`), and the drain that follows makes it needless.
+    ///
+    /// Returns `false` when nothing was queued: `normalized` is not finite, `param` is not one of
+    /// this plugin's parameters, or the queue is full. The step count is read from the wrapper's
+    /// own entry for the parameter, never through the caller's pointer.
+    pub fn queue_parameter_value_from_process(&self, param: ParamPtr, normalized: f32) -> bool {
+        if !normalized.is_finite() {
+            return false;
+        }
+        let Some(&param_hash) = self.param_ptr_to_hash.get(&param) else {
+            return false;
+        };
+        let Some(own_ptr) = self.param_by_hash.get(&param_hash) else {
+            return false;
+        };
+        let clap_plain_value =
+            normalized.clamp(0.0, 1.0) as f64 * unsafe { own_ptr.step_count() }.unwrap_or(1) as f64;
+        self.output_parameter_events
+            .push(OutputParamEvent::SetValue {
+                param_hash,
+                clap_plain_value,
+            })
+            .is_ok()
+    }
+
     /// Convenience function for setting a value for a parameter as triggered by a CLAP parameter
     /// update. The same rate is for updating parameter smoothing.
     ///

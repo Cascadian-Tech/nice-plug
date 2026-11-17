@@ -2,6 +2,7 @@
 
 use crate::{
     midi::{MidiConfig, PluginNoteEvent},
+    params::internals::ParamPtr,
     plugin::Plugin,
 };
 
@@ -98,6 +99,31 @@ pub trait ProcessContext<P: Plugin> {
     /// allows the host to better optimize polyphonic modulation, or to switch to strictly monophonic
     /// modulation when dropping the capacity down to 1.
     fn set_current_voice_capacity(&self, capacity: u32);
+
+    /// Queue a change of one of this plugin's OWN parameters, made from within
+    /// [`Plugin::process()`][crate::plugin::Plugin::process()]: the wrapper sets the parameter to
+    /// `normalized` (clamped to `[0, 1]`) and reports the new value to the host once the audio of
+    /// the current `process()` call has been processed, as it does for a change an editor makes
+    /// through `GuiContext`. One bare value event: no gesture is begun or ended around it.
+    ///
+    /// Returns `false`, having queued nothing, when the wrapper does not carry plugin-made
+    /// changes from `process()` (this default: only the CLAP wrapper does), and, in the CLAP
+    /// wrapper, when
+    ///
+    /// - this `process()` call is not the FIRST piece of the host's call
+    ///   ([`Plugin::SAMPLE_ACCURATE_AUTOMATION`][crate::plugin::Plugin::SAMPLE_ACCURATE_AUTOMATION]
+    ///   splits a host call at every parameter event): a plugin's own change is never made
+    ///   between two pieces of one host call, so a caller that is refused asks again in a later
+    ///   call;
+    /// - the host's call has no frames, or the host gave it no output event list;
+    /// - `normalized` is not finite, or `param` is not one of this plugin's parameters;
+    /// - the wrapper's queue of outgoing parameter events is full.
+    ///
+    /// Realtime-safe: a lookup and one push onto a lock-free queue, no host call (in particular
+    /// no `clap_host_params::request_flush()`, which CLAP forbids on the audio thread).
+    fn queue_parameter_value(&self, _param: ParamPtr, _normalized: f32) -> bool {
+        false
+    }
 
     // TODO: Add this, this works similar to [GuiContext::set_parameter] but it adds the parameter
     //       change to a queue (or directly to the VST3 plugin's parameter output queues) instead of

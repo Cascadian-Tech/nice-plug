@@ -104,6 +104,16 @@ impl<P: ClapPlugin> ActivateContext<P> for WrapperActivateContext<'_, P> {
     }
 }
 
+impl<P: ClapPlugin> WrapperProcessContext<'_, P> {
+    /// Whether a plugin-made parameter change may be queued from this `process()` call: only in
+    /// the first piece of a host call that has frames and an output event list, so that the change
+    /// is never made between two pieces of one host call and its event's time (the piece's first
+    /// frame, 0) lies inside the host's block.
+    fn accepts_parameter_value(&self) -> bool {
+        self.current_sample_idx == 0 && self.total_buffer_len > 0 && !self.host_out_events.is_null()
+    }
+}
+
 impl<P: ClapPlugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
     fn plugin_api(&self) -> PluginApi {
         PluginApi::Clap
@@ -517,6 +527,13 @@ impl<P: ClapPlugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
 
     fn request_restart(&self) {
         self.wrapper.request_restart();
+    }
+
+    fn queue_parameter_value(&self, param: ParamPtr, normalized: f32) -> bool {
+        self.accepts_parameter_value()
+            && self
+                .wrapper
+                .queue_parameter_value_from_process(param, normalized)
     }
 }
 
